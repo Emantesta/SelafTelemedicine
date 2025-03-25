@@ -1,4 +1,3 @@
-<xaiArtifact artifact_id="1e62448a-892a-4f9f-9fd7-fc177fcac614" artifact_version_id="3abc954e-278a-41bb-9d4f-63a760c625bc" title="TelemedicineCore.sol" contentType="text/solidity">
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 import {Initializable} from "@openzeppelin
@@ -293,5 +292,4 @@ receive() external payable {
 }
 
 }
-</xaiArtifact>
 
