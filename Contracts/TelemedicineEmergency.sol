@@ -1,4 +1,3 @@
-<xaiArtifact artifact_id="5add9d2b-0b18-4266-8202-009bd5274209" artifact_version_id="45be63c0-f4f4-425d-b943-54ba3f77eaa5" title="TelemedicineEmergency.sol" contentType="text/solidity">
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 import {Initializable} from "@openzeppelin
@@ -352,5 +351,4 @@ modifier onlyRole(bytes32 role) {
 }
 
 }
-</xaiArtifact>
 
