@@ -1,4 +1,3 @@
-<xaiArtifact artifact_id="b83c7ce2-14b6-4318-97ca-ad77c01830cb" artifact_version_id="5b5db18b-5ab5-4527-a0a9-510b4542e5b7" title="TelemedicinePayments.sol" contentType="text/solidity">
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 import {Initializable} from "@openzeppelin
@@ -369,5 +368,3 @@ modifier whenNotPaused() {
 }
 
 }
-</xaiArtifact>
-
