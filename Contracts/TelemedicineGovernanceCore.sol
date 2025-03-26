@@ -1,4 +1,3 @@
-<xaiArtifact artifact_id="0b3c0847-100a-49f7-b6af-9e794b32f12b" artifact_version_id="95faeab9-1821-47c2-8b38-335deba53b77" title="TelemedicineGovernanceCore.sol" contentType="text/solidity">
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 import {Initializable} from "@openzeppelin
@@ -413,5 +412,4 @@ modifier whenNotPaused() {
 }
 
 }
-</xaiArtifact>
 
