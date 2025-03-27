@@ -23,6 +23,26 @@ telemedicine-backend/
 ├── package.json
 
 
+telemedicine-backend/
+├── contracts/
+│   ├── TelemedicineCore.sol
+│   ├── TelemedicinePayments.sol
+│   ├── TelemedicineMedical.sol
+│   ├── SimplePaymaster.sol
+│   ├── SimpleAccountFactory.sol
+│   ├── TelemedicineGovernanceCore.sol
+│   ├── TelemedicineEmergency.sol
+│   ├── TelemedicineSubscription.sol
+├── deploy/
+│   ├── 00_deploy_all.js
+├── test/
+│   ├── backend.test.js
+├── backend.js
+├── .env
+├── hardhat.config.js
+├── package.json
+
+
 Development Instructions For Backend
 Prerequisites
 Node.js (v16+)
