@@ -86,7 +86,8 @@ npm test
 
 Directory Structure
 
-telemedicine-backend/
+telemedicine-blockchain/
+├── backend.js              # Backend API
 ├── contracts/
 │   ├── TelemedicineCore.sol
 │   ├── TelemedicinePayments.sol
@@ -99,8 +100,8 @@ telemedicine-backend/
 ├── deploy/
 │   ├── 00_deploy_all.js
 ├── test/
-│   ├── backend.test.js
-├── backend.js
+│   ├── backend.test.js     # Backend API tests
+│   ├── TelemedicineSystem.test.js  # Contract tests
 ├── .env
 ├── hardhat.config.js
 ├── package.json
