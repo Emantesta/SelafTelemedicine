@@ -89,7 +89,7 @@ const App = ({ account, signer, token }) => {
   const [aiFundBalance, setAIFundBalance] = useState('0');
   const [timeLocks, setTimeLocks] = useState([]);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [subscriptionStatus, setSubscriptionStatus] = useState({ isActive: false, expiry: 0 });
+  const [subscriptionStatus, setSubscriptionStatus] = useState({ isActive: false, expiry: 0, consultsUsed: 0 });
   const [loading, setLoading] = useState(false);
   const [nonceCache, setNonceCache] = useState({});
   const ws = useRef(null);
@@ -180,7 +180,7 @@ const App = ({ account, signer, token }) => {
         .required('Required'),
     }),
     subscription: Yup.object({
-      planId: Yup.number().min(0).max(2).required('Required'),
+      isAnnual: Yup.boolean().required('Required'),
       amount: Yup.string()
         .matches(/^\d+(\.\d+)?$/, 'Invalid amount')
         .transform(sanitizeInput)
@@ -222,7 +222,6 @@ const App = ({ account, signer, token }) => {
   const fetchInitialData = useCallback(debounce(async () => {
     setLoading(true);
     try {
-      // Selective fetching based on role
       const fetchPromises = [];
       if (role === 'patient' || role === 'doctor') fetchPromises.push(fetchAppointments());
       if (role === 'labTech') fetchPromises.push(fetchLabTests());
@@ -288,8 +287,8 @@ const App = ({ account, signer, token }) => {
   };
 
   const fetchSubscriptionStatus = async () => {
-    const { data } = await api.get(`/subscription-status/${account}`, token);
-    setSubscriptionStatus(data);
+    const [isActive, expiry, consultsUsed] = await contracts.subscription.methods.getSubscriptionStatus(account).call();
+    setSubscriptionStatus({ isActive, expiry: Number(expiry), consultsUsed: Number(consultsUsed) });
   };
 
   const createUserOp = async (callData, contractAddress, value = '0') => {
@@ -297,7 +296,6 @@ const App = ({ account, signer, token }) => {
       const accountAddress = await contracts.accountFactory.methods.getAddress(account, 0).call();
       const currentNonce = await contracts.core.methods.getNonce(accountAddress).call();
       
-      // Replay attack prevention
       if (nonceCache[accountAddress] && currentNonce <= nonceCache[accountAddress]) {
         throw new Error('Potential replay attack detected');
       }
@@ -391,7 +389,7 @@ const App = ({ account, signer, token }) => {
       value: ethers.utils.parseEther(values.amount),
       data: callData,
     });
-    await tx.wait();
+   <pre>await tx.wait();
     toast.success('AI fund deposited');
     fetchAIFundBalance();
   };
@@ -465,9 +463,11 @@ const App = ({ account, signer, token }) => {
   };
 
   const subscribe = async (values) => {
-    const callData = new ethers.utils.Interface(TelemedicineSubscriptionABI.abi).encodeFunctionData('subscribe', [values.planId]);
-    const userOp = await createUserOp(callData, process.env.REACT_APP_SUBSCRIPTION_ADDRESS, ethers.utils.parseEther(values.amount));
-    await handleContractCall('/subscribe', { ...values, userOp }, 'Subscription activated');
+    const callData = new ethers.utils.Interface(TelemedicineSubscriptionABI.abi).encodeFunctionData('subscribe', [values.isAnnual]);
+    // USDC has 6 decimals, so multiply by 10^6
+    const amountInUSDC = ethers.utils.parseUnits(values.amount, 6);
+    const userOp = await createUserOp(callData, process.env.REACT_APP_SUBSCRIPTION_ADDRESS, '0'); // No ETH value, using USDC
+    await handleContractCall('/subscribe', { ...values, userOp, amount: amountInUSDC.toString() }, 'Subscription activated');
   };
 
   const handleEmergency = async () => {
@@ -499,6 +499,7 @@ const App = ({ account, signer, token }) => {
             <p className="text-gray-600">Paymaster: {paymasterStatus?.paymaster || 'N/A'} ({paymasterStatus?.isTrusted ? 'Trusted' : 'Untrusted'})</p>
             <p className="text-gray-600">AI Fund: {aiFundBalance} ETH</p>
             <p className="text-gray-600">Subscription: {subscriptionStatus.isActive ? 'Active' : 'Inactive'} (Expires: {new Date(subscriptionStatus.expiry * 1000).toLocaleString()})</p>
+            <p className="text-gray-600">Consults Used: {subscriptionStatus.consultsUsed}</p>
           </div>
           <div className="bg-white p-6 rounded-lg shadow-md">
             <h2 className="text-xl font-semibold mb-4 text-gray-700">Book Appointment</h2>
@@ -535,7 +536,7 @@ const App = ({ account, signer, token }) => {
                     </div>
                   )}
                   <div>
-                    <Field name="amount" placeholder="Amount (ETH)" className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-200" disabled={isSubmitting} />
+                    <Field name="amount" placeholder="Amount" className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-200" disabled={isSubmitting} />
                     <ErrorMessage name="amount" component="div" className="text-red-500 text-sm mt-1" />
                   </div>
                   <button type="submit" disabled={isSubmitting || loading} className="bg-blue-600 hover:bg-blue-700 text-white p-3 rounded-lg w-full transition duration-200 disabled:bg-gray-400">
@@ -579,18 +580,32 @@ const App = ({ account, signer, token }) => {
           </div>
           <div className="bg-white p-6 rounded-lg shadow-md">
             <h2 className="text-xl font-semibold mb-4 text-gray-700">Subscription</h2>
-            <Formik initialValues={{ planId: 0, amount: '' }} validationSchema={schemas.subscription} onSubmit={subscribe}>
-              {({ isSubmitting }) => (
+            <Formik initialValues={{ isAnnual: false, amount: '' }} validationSchema={schemas.subscription} onSubmit={subscribe}>
+              {({ isSubmitting, values, setFieldValue }) => (
                 <Form className="space-y-4">
                   <div>
-                    <Field name="planId" as="select" className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-200" disabled={isSubmitting}>
-                      <option value={0}>Basic (0.01 ETH)</option>
-                      <option value={1}>Premium (0.05 ETH)</option>
-                      <option value={2}>Elite (0.1 ETH)</option>
+                    <Field 
+                      name="isAnnual" 
+                      as="select" 
+                      className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-200" 
+                      disabled={isSubmitting}
+                      onChange={(e) => {
+                        const isAnnual = e.target.value === 'true';
+                        setFieldValue('isAnnual', isAnnual);
+                        setFieldValue('amount', isAnnual ? '200' : '20'); // Set default USDC amounts
+                      }}
+                    >
+                      <option value={false}>Monthly (20 USDC)</option>
+                      <option value={true}>Annual (200 USDC)</option>
                     </Field>
                   </div>
                   <div>
-                    <Field name="amount" placeholder="Amount (ETH)" className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-200" disabled={isSubmitting} />
+                    <Field 
+                      name="amount" 
+                      placeholder="Amount (USDC)" 
+                      className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-200" 
+                      disabled={isSubmitting} 
+                    />
                     <ErrorMessage name="amount" component="div" className="text-red-500 text-sm mt-1" />
                   </div>
                   <button type="submit" disabled={isSubmitting || loading} className="bg-purple-600 hover:bg-purple-700 text-white p-3 rounded-lg w-full transition duration-200 disabled:bg-gray-400">
