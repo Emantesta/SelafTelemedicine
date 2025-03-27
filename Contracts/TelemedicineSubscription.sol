@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
-import {Initializable} from "@openzeppelin
-/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin
-/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import {SafeMathUpgradeable} from "@openzeppelin
-/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
-import {IERC20} from "@openzeppelin
-/contracts/token/ERC20/IERC20.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {SafeMathUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TelemedicineCore} from "./TelemedicineCore.sol";
 import {TelemedicinePayments} from "./TelemedicinePayments.sol";
 contract TelemedicineSubscription is Initializable, ReentrancyGuardUpgradeable {
