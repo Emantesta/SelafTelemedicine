@@ -15,16 +15,11 @@
     "format": "prettier --write ."
   },
   "dependencies": {
-    "@account
--abstraction/contracts": "^0.6.0",
-    "@account
--abstraction/utils": "^0.6.0",
-    "@openzeppelin
-/contracts": "^4.9.3",
-    "@openzeppelin
-/contracts-upgradeable": "^4.9.3",
-    "@tensorflow
-/tfjs-node": "^4.4.0",
+    "@account-abstraction/contracts": "^0.6.0",
+    "@account-abstraction/utils": "^0.6.0",
+    "@openzeppelin/contracts": "^4.9.3",
+    "@openzeppelin/contracts-upgradeable": "^4.9.3",
+    "@tensorflow/tfjs-node": "^4.4.0",
     "axios": "^1.6.7",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
@@ -39,10 +34,8 @@
     "winston": "^3.8.2"
   },
   "devDependencies": {
-    "@nomiclabs
-/hardhat-ethers": "^2.2.3",
-    "@nomiclabs
-/hardhat-waffle": "^2.0.6",
+    "@nomiclabs/hardhat-ethers": "^2.2.3",
+    "@nomiclabs/hardhat-waffle": "^2.0.6",
     "chai": "^4.3.7",
     "eslint": "^8.36.0",
     "eslint-config-prettier": "^8.8.0",
