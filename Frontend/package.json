@@ -17,6 +17,7 @@
     "react-scripts": "5.0.1",
     "react-toastify": "^9.1.1",
     "web3": "^1.9.0",
+    "websocket": "^1.0.34",
     "yup": "^0.32.11"
   },
   "scripts": {
