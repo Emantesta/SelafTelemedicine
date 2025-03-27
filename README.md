@@ -34,6 +34,11 @@ npx hardhat deploy --network hardhat
 
 Update .env with deployed contract addresses from the output.
 
+Run Backend:
+bash
+
+npm run dev
+
 Start MongoDB (if not running):
 bash
 
@@ -80,9 +85,10 @@ bash
 npx hardhat deploy --network hardhat
 
 Run Tests:
-bash
+Backend tests: npm test
 
-npm test
+Contract tests: npm run test:contracts
+
 
 Directory Structure
 
