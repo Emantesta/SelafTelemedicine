@@ -22,6 +22,7 @@ module.exports = {
       url: SONIC_RPC_URL,
       accounts: [PRIVATE_KEY],
       chainId: 641, // Replace with actual Sonic chain ID
+      gasPrice: "auto",
     },
   },
   namedAccounts: {
@@ -42,4 +43,18 @@ module.exports = {
   mocha: {
     timeout: 40000,
   },
+  etherscan: {
+    apiKey: process.env.ETHERSCAN_API_KEY,
+    customChains: [
+      {
+        network: "sonic",
+        chainId: 641, // Replace with actual Sonic chain ID
+        urls: {
+          apiURL: "https://api.sonic.example.com", // Replace with actual Sonic explorer API
+          browserURL: "https://explorer.sonic.example.com", // Replace with actual Sonic explorer
+        },
+      },
+    ],
+  },
 };
+
