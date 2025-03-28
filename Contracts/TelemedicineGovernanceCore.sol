@@ -33,7 +33,7 @@ mapping(address => bool) public trustedPaymasters;
 mapping(uint256 => TimeLock) public timeLocks;
 uint256 public timeLockCounter;
 
-enum TimeLockAction { WithdrawFunds, AddAdmin, RemoveAdmin, AdjustFee, AdjustMaxEmergencyWithdrawal, UpgradeContract }
+enum TimeLockAction { WithdrawFunds, AddAdmin, RemoveAdmin, AdjustFee, AdjustMaxEmergencyWithdrawal, UpgradeContract, DisputeResolution }
 
 struct TimeLock {
     uint256 id;
