@@ -11,10 +11,12 @@ import {IERC20Upgradeable} from "@openzeppelin
 import {AggregatorV3Interface} from "@chainlink
 /contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import {TelemedicineCore} from "./TelemedicineCore.sol";
+import {TelemedicineDisputeResolution} from "./TelemedicineDisputeResolution.sol";
 contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     using SafeMathUpgradeable for uint256;
 
 TelemedicineCore public core;
+TelemedicineDisputeResolution public disputeResolution;
 IERC20Upgradeable public usdcToken;
 IERC20Upgradeable public sonicToken;
 AggregatorV3Interface public ethUsdPriceFeed;
@@ -69,6 +71,7 @@ event OnRampProviderUpdated(address indexed oldProvider, address indexed newProv
 event OffRampProviderUpdated(address indexed oldProvider, address indexed newProvider);
 event RampFeeUpdated(string indexed rampType, uint256 oldFee, uint256 newFee);
 event PriceFeedUpdated(string indexed feedType, address indexed oldFeed, address indexed newFeed);
+event PatientRefunded(uint256 indexed disputeId, address indexed patient, uint256 amount, PaymentType paymentType);
 
 function initialize(
     address _core,
@@ -78,7 +81,8 @@ function initialize(
     address _sonicUsdPriceFeed,
     address _usdFiatOracle,
     address _onRampProvider,
-    address _offRampProvider
+    address _offRampProvider,
+    address _disputeResolution
 ) external initializer {
     __ReentrancyGuard_init();
     core = TelemedicineCore(_core);
@@ -89,6 +93,7 @@ function initialize(
     usdFiatOracle = AggregatorV3Interface(_usdFiatOracle);
     onRampProvider = _onRampProvider;
     offRampProvider = _offRampProvider;
+    disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
     trustedOracles.push(_ethUsdPriceFeed);
     trustedOracles.push(_sonicUsdPriceFeed);
     trustedOracles.push(_usdFiatOracle);
@@ -258,7 +263,7 @@ function _processPayment(PaymentType _type, uint256 _amount) internal {
     }
 }
 
-function _refundPatient(address _patient, uint256 _amount, PaymentType _type) internal {
+function refundPatient(address _patient, uint256 _amount, PaymentType _type, uint256 _disputeId) external onlyDisputeResolution nonReentrant whenNotPaused {
     if (_amount == 0) return;
     require(core.getReserveFundBalance() >= core.RESERVE_FUND_THRESHOLD(), "Reserve fund too low");
     if (_type == PaymentType.ETH) {
@@ -270,6 +275,7 @@ function _refundPatient(address _patient, uint256 _amount, PaymentType _type) in
     } else if (_type == PaymentType.SONIC) {
         require(sonicToken.transfer(_patient, _amount), "SONIC refund failed");
     }
+    emit PatientRefunded(_disputeId, _patient, _amount, _type);
 }
 
 function _calculateCryptoAmount(uint256 _fiatAmount, PaymentType _targetToken) internal view returns (uint256) {
@@ -362,9 +368,16 @@ modifier onlyRole(bytes32 role) {
     _;
 }
 
+modifier onlyDisputeResolution() {
+    require(msg.sender == address(disputeResolution), "Only dispute resolution can call");
+    _;
+}
+
 modifier whenNotPaused() {
     require(!core.paused(), "Pausable: paused");
     _;
 }
+
+receive() external payable {}
 
 }
