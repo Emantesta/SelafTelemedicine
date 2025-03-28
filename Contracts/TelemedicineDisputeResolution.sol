@@ -240,7 +240,7 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
 
         bytes memory data = abi.encodeWithSignature("executeResolveDispute(uint256,bool,bytes32)", _disputeId, _patientWins, _resolutionReason);
         governance._queueTimeLock(
-            TelemedicineGovernanceCore.TimeLockAction(5), // Assuming 5 is a new DisputeResolution action; adjust as needed
+            TelemedicineGovernanceCore.TimeLockAction(6), // Assuming 6 is a new DisputeResolution action; adjust as needed
             address(this),
             0,
             data
