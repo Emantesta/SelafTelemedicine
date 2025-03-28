@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
-import {Initializable} from "@openzeppelin
-/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin
-/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import {SafeMathUpgradeable} from "@openzeppelin
-/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {SafeMathUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 import {TelemedicineCore} from "./TelemedicineCore.sol";
 import {TelemedicinePayments} from "./TelemedicinePayments.sol";
+import {TelemedicineDisputeResolution} from "./TelemedicineDisputeResolution.sol";
 contract TelemedicineMedical is Initializable, ReentrancyGuardUpgradeable {
     using SafeMathUpgradeable for uint256;
 
 TelemedicineCore public core;
 TelemedicinePayments public payments;
+TelemedicineDisputeResolution public disputeResolution;
 
 mapping(uint256 => Appointment) public appointments;
 mapping(uint256 => LabTestOrder) public labTestOrders;
@@ -107,11 +106,13 @@ event BatchAppointmentsConfirmed(address indexed doctor, uint256[] appointmentId
 event DoctorPaid(uint256 indexed appointmentId, address indexed doctor, uint256 amount, TelemedicinePayments.PaymentType paymentType);
 event ReserveFundAllocated(uint256 indexed appointmentId, uint256 amount, TelemedicinePayments.PaymentType paymentType);
 event PlatformFeeAllocated(uint256 indexed appointmentId, uint256 amount, TelemedicinePayments.PaymentType paymentType);
+event ReplacementPrescriptionOrdered(uint256 indexed originalPrescriptionId, uint256 indexed newPrescriptionId);
 
-function initialize(address _core, address _payments) external initializer {
+function initialize(address _core, address _payments, address _disputeResolution) external initializer {
     __ReentrancyGuard_init();
     core = TelemedicineCore(_core);
     payments = TelemedicinePayments(_payments);
+    disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
 }
 
 function bookAppointment(
@@ -143,7 +144,6 @@ function bookAppointment(
         require(msg.value >= discountedFee, "Insufficient ETH payment");
         core.reserveFund = core.reserveFund.add(reserveAmount);
         emit ReserveFundAllocated(newAppointmentId, reserveAmount, _paymentType);
-        // Platform fee stays in this contract for now; could transfer to payments
         emit PlatformFeeAllocated(newAppointmentId, platformAmount, _paymentType);
         if (msg.value > discountedFee) {
             uint256 refund = msg.value.sub(discountedFee);
@@ -394,6 +394,34 @@ function fulfillPrescription(uint256 _prescriptionId) external onlyRole(core.PHA
     emit PrescriptionFulfilled(_prescriptionId);
 }
 
+// Dispute Resolution Integration
+function orderReplacementPrescription(uint256 _originalPrescriptionId) external onlyDisputeResolution whenNotPaused {
+    Prescription storage originalPrescription = prescriptions[_originalPrescriptionId];
+    require(originalPrescription.status == PrescriptionStatus.Fulfilled, "Original prescription not fulfilled");
+    require(originalPrescription.pharmacy != address(0), "No pharmacy assigned");
+
+    prescriptionCounter = prescriptionCounter.add(1);
+    uint256 newPrescriptionId = prescriptionCounter;
+
+    bytes32 newVerificationCodeHash = keccak256(abi.encodePacked(newPrescriptionId, originalPrescription.doctor, block.timestamp));
+    prescriptions[newPrescriptionId] = Prescription({
+        id: newPrescriptionId,
+        patient: originalPrescription.patient,
+        doctor: originalPrescription.doctor,
+        verificationCodeHash: newVerificationCodeHash,
+        status: PrescriptionStatus.Generated,
+        pharmacy: originalPrescription.pharmacy,
+        generatedTimestamp: uint48(block.timestamp),
+        expirationTimestamp: uint48(block.timestamp.add(30 days)),
+        medicationDetails: originalPrescription.medicationDetails,
+        prescriptionIpfsHash: originalPrescription.prescriptionIpfsHash
+    });
+
+    emit PrescriptionIssued(newPrescriptionId, originalPrescription.patient, originalPrescription.doctor, newVerificationCodeHash, uint48(block.timestamp));
+    emit ReplacementPrescriptionOrdered(_originalPrescriptionId, newPrescriptionId);
+}
+
+// Internal Functions
 function _monetizeData(address _patient) internal {
     TelemedicineCore.Patient storage patient = core.patients(_patient);
     if (patient.dataSharing == TelemedicineCore.DataSharingStatus.Enabled && block.timestamp >= patient.lastRewardTimestamp.add(1 days)) {
@@ -437,6 +465,7 @@ function _hasPendingPriorityAppointments(address _doctor) internal view returns 
     return false;
 }
 
+// View Functions
 function getPendingAppointments(address _doctor, uint256 _start, uint256 _limit) external view returns (uint256[] memory) {
     PendingAppointments storage pending = doctorPendingAppointments[_doctor];
     require(_start <= pending.count, "Start index out of bounds");
@@ -448,8 +477,14 @@ function getPendingAppointments(address _doctor, uint256 _start, uint256 _limit)
     return result;
 }
 
+// Modifiers
 modifier onlyRole(bytes32 role) {
     require(core.hasRole(role, msg.sender), "Unauthorized");
+    _;
+}
+
+modifier onlyDisputeResolution() {
+    require(msg.sender == address(disputeResolution), "Only dispute resolution can call");
     _;
 }
 
@@ -458,6 +493,7 @@ modifier whenNotPaused() {
     _;
 }
 
+// Fallback
 receive() external payable {}
 
 }
