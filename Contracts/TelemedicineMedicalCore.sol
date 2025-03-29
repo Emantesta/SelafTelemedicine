@@ -161,6 +161,7 @@ contract TelemedicineMedicalCore is Initializable, ReentrancyGuardUpgradeable, C
     event ReplacementPrescriptionOrdered(uint256 indexed originalPrescriptionId, uint256 indexed newPrescriptionId);
     event AppointmentReminderSent(uint256 indexed appointmentId, address patient, uint48 timestamp);
     event CancellationFeeCharged(uint256 indexed appointmentId, uint256 amount);
+    event FundsWithdrawn(address indexed recipient, uint256 amount, TelemedicinePayments.PaymentType paymentType);
 
     // Initialization
     function initialize(
@@ -374,6 +375,16 @@ contract TelemedicineMedicalCore is Initializable, ReentrancyGuardUpgradeable, C
         whenNotPaused 
         onlyMultiSig(_operationHash)
     {
+        // Generate expected operation hash
+        bytes32 expectedHash = keccak256(abi.encodePacked(
+            "completeAppointment",
+            _appointmentId,
+            _ipfsSummary,
+            msg.sender,
+            block.timestamp
+        ));
+        if (_operationHash != expectedHash) revert MultiSigNotApproved();
+
         Appointment storage apt = appointments[_appointmentId];
         bool isDoctor = false;
         for (uint256 i = 0; i < apt.doctors.length; i++) {
@@ -582,12 +593,22 @@ contract TelemedicineMedicalCore is Initializable, ReentrancyGuardUpgradeable, C
         emit PrescriptionFulfilled(_prescriptionId);
     }
 
-    function orderReplacementPrescription(uint256 _originalPrescriptionId) 
+    function orderReplacementPrescription(uint256 _originalPrescriptionId, bytes32 _operationHash) 
         external 
         onlyDisputeResolution 
         nonReentrant 
         whenNotPaused 
+        onlyMultiSig(_operationHash)
     {
+        // Generate expected operation hash
+        bytes32 expectedHash = keccak256(abi.encodePacked(
+            "orderReplacementPrescription",
+            _originalPrescriptionId,
+            msg.sender,
+            block.timestamp
+        ));
+        if (_operationHash != expectedHash) revert MultiSigNotApproved();
+
         Prescription storage original = prescriptions[_originalPrescriptionId];
         if (original.status != PrescriptionStatus.Fulfilled) revert InvalidStatus();
         if (original.pharmacy == address(0)) revert InvalidAddress();
@@ -661,6 +682,44 @@ contract TelemedicineMedicalCore is Initializable, ReentrancyGuardUpgradeable, C
         analysis.doctorReviewed = true;
     }
 
+    // Fund Withdrawal Function
+    function withdrawFunds(
+        address _recipient,
+        uint256 _amount,
+        TelemedicinePayments.PaymentType _paymentType,
+        bytes32 _operationHash
+    ) external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused onlyMultiSig(_operationHash) {
+        // Generate expected operation hash
+        bytes32 expectedHash = keccak256(abi.encodePacked(
+            "withdrawFunds",
+            _recipient,
+            _amount,
+            _paymentType,
+            msg.sender,
+            block.timestamp
+        ));
+        if (_operationHash != expectedHash) revert MultiSigNotApproved();
+
+        if (_recipient == address(0)) revert InvalidAddress();
+        if (_amount == 0) revert InsufficientFunds();
+
+        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+            if (address(this).balance < _amount) revert InsufficientFunds();
+            (bool success, ) = _recipient.call{value: _amount}("");
+            if (!success) revert("ETH withdrawal failed");
+        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+            if (payments.usdcToken().balanceOf(address(this)) < _amount) revert InsufficientFunds();
+            if (!payments.usdcToken().transfer(_recipient, _amount)) revert("USDC withdrawal failed");
+        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
+            if (payments.sonicToken().balanceOf(address(this)) < _amount) revert InsufficientFunds();
+            if (!payments.sonicToken().transfer(_recipient, _amount)) revert("SONIC withdrawal failed");
+        } else {
+            revert InvalidStatus();
+        }
+
+        emit FundsWithdrawn(_recipient, _amount, _paymentType);
+    }
+
     // Internal Functions
     function _addPendingAppointment(address _doctor, uint256 _appointmentId) internal {
         PendingAppointments storage pending = doctorPendingAppointments[_doctor];
@@ -716,4 +775,3 @@ contract TelemedicineMedicalCore is Initializable, ReentrancyGuardUpgradeable, C
 
     // Fallback
     receive() external payable {}
-}
