@@ -99,6 +99,30 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     event PaymentReleasedFromQueue(uint256 indexed paymentId, address recipient, uint256 amount);
     event PendingPaymentCleaned(uint256 indexed paymentId, address recipient, uint256 amount);
 
+    /// @notice Queues a payment when funds are insufficient
+    /// @param _recipient Address to receive the payment
+    /// @param _amount Amount to queue
+    /// @param _paymentType Type of payment (ETH, USDC, SONIC)
+    /// @param _timestamp Timestamp of the request
+    function queuePayment(address _recipient, uint256 _amount, PaymentType _paymentType, uint48 _timestamp) 
+        external 
+        nonReentrant 
+        whenNotPaused 
+    {
+        if (_recipient == address(0)) revert InvalidAddress();
+        if (_amount == 0) revert InsufficientFunds();
+        
+        pendingPaymentCounter = pendingPaymentCounter.add(1);
+        pendingPayments[pendingPaymentCounter] = PendingPayment(
+            _recipient,
+            _amount,
+            _paymentType,
+            false,
+            _timestamp
+        );
+        emit PaymentQueued(pendingPaymentCounter, _recipient, _amount, _paymentType);
+    }
+
     /// @notice Initializes the contract with external dependencies and default settings
     /// @param _core Address of the TelemedicineCore contract
     /// @param _usdcToken Address of the USDC token contract
