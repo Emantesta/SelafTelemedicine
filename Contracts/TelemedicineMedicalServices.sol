@@ -29,6 +29,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     error InvalidIpfsHash();
     error MultiSigNotApproved();
     error AlreadySigned();
+    error AlreadyRegistered();
+    error NotRegistered();
+    error InvalidPrice();
 
     // Contract dependencies
     TelemedicineCore public core;
@@ -87,7 +90,18 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     event DataRewardClaimed(address indexed patient, uint256 amount);
     event MultiSigApproval(address indexed signer, bytes32 indexed operationHash);
 
-    // Initialization
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// @notice Initializes the medical services contract with dependencies and multi-sig configuration
+    /// @param _core Address of the TelemedicineCore contract
+    /// @param _payments Address of the TelemedicinePayments contract
+    /// @param _disputeResolution Address of the TelemedicineDisputeResolution contract
+    /// @param _medicalCore Address of the TelemedicineMedicalCore contract
+    /// @param _multiSigSigners Array of multi-sig signer addresses
+    /// @param _requiredSignatures Number of required signatures for multi-sig approval
     function initialize(
         address _core,
         address _payments,
@@ -110,6 +124,8 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     }
 
     // Provider Registration
+
+    /// @notice Registers a lab technician
     function registerLabTech() external nonReentrant whenNotPaused onlyRole(core.LAB_TECH_ROLE()) {
         if (labTechIndex[msg.sender] != 0 && labTechList[labTechIndex[msg.sender] - 1] == msg.sender) 
             revert AlreadyRegistered();
@@ -118,6 +134,7 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         emit LabTechRegistered(msg.sender);
     }
 
+    /// @notice Registers a pharmacy
     function registerPharmacy() external nonReentrant whenNotPaused onlyRole(core.PHARMACY_ROLE()) {
         if (pharmacyIndex[msg.sender] != 0 && pharmacyList[pharmacyIndex[msg.sender] - 1] == msg.sender) 
             revert AlreadyRegistered();
@@ -127,6 +144,10 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     }
 
     // Pricing Functions
+
+    /// @notice Updates the price for a lab test type
+    /// @param _testTypeIpfsHash IPFS hash of the test type
+    /// @param _price Price in wei
     function updateLabTechPrice(string calldata _testTypeIpfsHash, uint256 _price) 
         external 
         onlyRole(core.LAB_TECH_ROLE()) 
@@ -141,6 +162,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         emit LabTechPriceUpdated(msg.sender, _testTypeIpfsHash, _price, uint48(block.timestamp));
     }
 
+    /// @notice Updates the price for a medication
+    /// @param _medicationIpfsHash IPFS hash of the medication
+    /// @param _price Price in wei
     function updatePharmacyPrice(string calldata _medicationIpfsHash, uint256 _price) 
         external 
         onlyRole(core.PHARMACY_ROLE()) 
@@ -156,6 +180,10 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     }
 
     // Rating System
+
+    /// @notice Rates a completed lab test
+    /// @param _labTestId ID of the lab test
+    /// @param _rating Rating value (1 to MAX_RATING)
     function rateLabTest(uint256 _labTestId, uint256 _rating) 
         external 
         onlyRole(core.PATIENT_ROLE()) 
@@ -176,6 +204,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         emit LabTestRated(_labTestId, msg.sender, order.labTech, _rating);
     }
 
+    /// @notice Rates a fulfilled prescription
+    /// @param _prescriptionId ID of the prescription
+    /// @param _rating Rating value (1 to MAX_RATING)
     function ratePrescription(uint256 _prescriptionId, uint256 _rating) 
         external 
         onlyRole(core.PATIENT_ROLE()) 
@@ -197,6 +228,10 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     }
 
     // Dispute Resolution
+
+    /// @notice Initiates a dispute for a medical service (appointment, lab test, or prescription)
+    /// @param _serviceId ID of the service to dispute
+    /// @param _serviceType Type of service ("Appointment", "LabTest", or "Prescription")
     function initiateDispute(uint256 _serviceId, string calldata _serviceType) 
         external 
         onlyRole(core.PATIENT_ROLE()) 
@@ -204,36 +239,68 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         whenNotPaused 
     {
         if (_serviceId == 0) revert InvalidIndex();
+        if (disputeResolution.isDisputed(_serviceId)) revert DisputeWindowActive();
+
         if (keccak256(abi.encodePacked(_serviceType)) == keccak256(abi.encodePacked("Appointment"))) {
             if (_serviceId > medicalCore.appointmentCounter()) revert InvalidIndex();
             TelemedicineMedicalCore.Appointment memory apt = medicalCore.appointments(_serviceId);
             if (msg.sender != apt.patient) revert NotAuthorized();
-            if (apt.status != TelemedicineMedicalCore.AppointmentStatus.Completed || block.timestamp > apt.disputeWindowEnd) revert DisputeWindowActive();
+            if (apt.status != TelemedicineMedicalCore.AppointmentStatus.Completed || 
+                block.timestamp > apt.disputeWindowEnd) revert DisputeWindowActive();
+            
             medicalCore.appointments(_serviceId).status = TelemedicineMedicalCore.AppointmentStatus.Disputed;
-            disputeResolution.initiateDispute(_serviceId, "Appointment", apt.patient, apt.doctors[0], apt.fee, "Patient initiated");
+            disputeResolution.initiateDispute(
+                apt.doctors[0], 
+                address(0), 
+                address(0), 
+                TelemedicineDisputeResolution.DisputeType.Misdiagnosis, 
+                _serviceId
+            );
             emit DisputeInitiated(_serviceId, "Appointment", apt.patient, apt.doctors[0]);
-        } else if (keccak256(abi.encodePacked(_serviceType)) == keccak256(abi.encodePacked("LabTest"))) {
+        } 
+        else if (keccak256(abi.encodePacked(_serviceType)) == keccak256(abi.encodePacked("LabTest"))) {
             if (_serviceId > medicalCore.labTestCounter()) revert InvalidIndex();
             TelemedicineMedicalCore.LabTestOrder memory order = medicalCore.labTestOrders(_serviceId);
             if (msg.sender != order.patient) revert NotAuthorized();
-            if (order.status != TelemedicineMedicalCore.LabTestStatus.Reviewed || block.timestamp > order.disputeWindowEnd) revert DisputeWindowActive();
+            if (order.status != TelemedicineMedicalCore.LabTestStatus.Reviewed || 
+                block.timestamp > order.disputeWindowEnd) revert DisputeWindowActive();
+            
             medicalCore.labTestOrders(_serviceId).status = TelemedicineMedicalCore.LabTestStatus.Disputed;
-            disputeResolution.initiateDispute(_serviceId, "LabTest", order.patient, order.labTech, order.patientCost, "Patient initiated");
+            disputeResolution.initiateDispute(
+                address(0), 
+                order.labTech, 
+                address(0), 
+                TelemedicineDisputeResolution.DisputeType.LabError, 
+                _serviceId
+            );
             emit DisputeInitiated(_serviceId, "LabTest", order.patient, order.labTech);
-        } else if (keccak256(abi.encodePacked(_serviceType)) == keccak256(abi.encodePacked("Prescription"))) {
+        } 
+        else if (keccak256(abi.encodePacked(_serviceType)) == keccak256(abi.encodePacked("Prescription"))) {
             if (_serviceId > medicalCore.prescriptionCounter()) revert InvalidIndex();
             TelemedicineMedicalCore.Prescription memory prescription = medicalCore.prescriptions(_serviceId);
             if (msg.sender != prescription.patient) revert NotAuthorized();
-            if (prescription.status != TelemedicineMedicalCore.PrescriptionStatus.Fulfilled || block.timestamp > prescription.disputeWindowEnd) revert DisputeWindowActive();
+            if (prescription.status != TelemedicineMedicalCore.PrescriptionStatus.Fulfilled || 
+                block.timestamp > prescription.disputeWindowEnd) revert DisputeWindowActive();
+            
             medicalCore.prescriptions(_serviceId).status = TelemedicineMedicalCore.PrescriptionStatus.Disputed;
-            disputeResolution.initiateDispute(_serviceId, "Prescription", prescription.patient, prescription.pharmacy, prescription.patientCost, "Patient initiated");
+            disputeResolution.initiateDispute(
+                address(0), 
+                address(0), 
+                prescription.pharmacy, 
+                TelemedicineDisputeResolution.DisputeType.PharmacyError, 
+                _serviceId
+            );
             emit DisputeInitiated(_serviceId, "Prescription", prescription.patient, prescription.pharmacy);
-        } else {
+        } 
+        else {
             revert InvalidStatus();
         }
     }
 
     // Data Monetization
+
+    /// @notice Allows MedicalCore to trigger data reward claims
+    /// @param _patient Address of the patient claiming the reward
     function monetizeData(address _patient) external onlyMedicalCore {
         TelemedicineCore.Patient storage patient = core.patients(_patient);
         if (patient.dataSharing == TelemedicineCore.DataSharingStatus.Enabled && 
@@ -247,6 +314,7 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         }
     }
 
+    /// @notice Allows patients to claim data monetization rewards
     function claimDataReward() external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
         TelemedicineCore.Patient storage patient = core.patients(msg.sender);
         if (patient.dataSharing != TelemedicineCore.DataSharingStatus.Enabled) revert NotAuthorized();
@@ -259,6 +327,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     }
 
     // Multi-sig Functions
+
+    /// @notice Approves a critical operation with multi-sig
+    /// @param _operationHash Hash of the operation to approve
     function approveCriticalOperation(bytes32 _operationHash) external {
         bool isSigner = false;
         for (uint256 i = 0; i < multiSigSigners.length; i++) {
@@ -274,6 +345,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         emit MultiSigApproval(msg.sender, _operationHash);
     }
 
+    /// @notice Checks if an operation has enough multi-sig approvals
+    /// @param _operationHash Hash of the operation to check
+    /// @return True if the required number of signatures is met
     function checkMultiSigApproval(bytes32 _operationHash) public view returns (bool) {
         uint256 approvalCount = 0;
         for (uint256 i = 0; i < multiSigSigners.length; i++) {
@@ -285,14 +359,26 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     }
 
     // View Functions
+
+    /// @notice Checks if a lab technician is registered
+    /// @param _labTech Address of the lab technician
+    /// @return True if registered
     function isLabTechRegistered(address _labTech) external view returns (bool) {
         return labTechIndex[_labTech] != 0 && labTechList[labTechIndex[_labTech] - 1] == _labTech;
     }
 
+    /// @notice Checks if a pharmacy is registered
+    /// @param _pharmacy Address of the pharmacy
+    /// @return True if registered
     function isPharmacyRegistered(address _pharmacy) external view returns (bool) {
         return pharmacyIndex[_pharmacy] != 0 && pharmacyList[pharmacyIndex[_pharmacy] - 1] == _pharmacy;
     }
 
+    /// @notice Retrieves pending appointments for a doctor
+    /// @param _doctor Address of the doctor
+    /// @param _page Page number
+    /// @param _pageSize Size of each page
+    /// @return appointmentIds Array of appointment IDs, totalPages Total number of pages
     function getPendingAppointments(address _doctor, uint256 _page, uint256 _pageSize) 
         external 
         view 
@@ -314,6 +400,10 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         }
     }
 
+    /// @notice Retrieves a paginated list of lab technicians
+    /// @param _page Page number
+    /// @param _pageSize Size of each page
+    /// @return labTechs Array of lab tech addresses, totalPages Total number of pages
     function getLabTechs(uint256 _page, uint256 _pageSize) 
         external 
         view 
@@ -332,6 +422,10 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         }
     }
 
+    /// @notice Retrieves a paginated list of pharmacies
+    /// @param _page Page number
+    /// @param _pageSize Size of each page
+    /// @return pharmacies Array of pharmacy addresses, totalPages Total number of pages
     function getPharmacies(uint256 _page, uint256 _pageSize) 
         external 
         view 
@@ -350,6 +444,10 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         }
     }
 
+    /// @notice Retrieves the price for a lab test type
+    /// @param _labTech Address of the lab technician
+    /// @param _testTypeIpfsHash IPFS hash of the test type
+    /// @return price Price in wei, isValid Whether the price is still valid
     function getLabTechPrice(address _labTech, string calldata _testTypeIpfsHash) 
         external 
         view 
@@ -364,6 +462,10 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         return (0, false);
     }
 
+    /// @notice Retrieves the price for a medication
+    /// @param _pharmacy Address of the pharmacy
+    /// @param _medicationIpfsHash IPFS hash of the medication
+    /// @return price Price in wei, isValid Whether the price is still valid
     function getPharmacyPrice(address _pharmacy, string calldata _medicationIpfsHash) 
         external 
         view 
@@ -378,6 +480,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         return (0, false);
     }
 
+    /// @notice Retrieves details of a lab test order
+    /// @param _labTestId ID of the lab test
+    /// @return status, orderedTimestamp, completedTimestamp, patientCost, disputeOutcome
     function getLabTestDetails(uint256 _labTestId) 
         external 
         view 
@@ -406,6 +511,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         );
     }
 
+    /// @notice Retrieves details of a prescription
+    /// @param _prescriptionId ID of the prescription
+    /// @return status, generatedTimestamp, expirationTimestamp, patientCost, disputeOutcome
     function getPrescriptionDetails(uint256 _prescriptionId) 
         external 
         view 
@@ -434,6 +542,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         );
     }
 
+    /// @notice Retrieves the average rating and count for a lab technician
+    /// @param _labTech Address of the lab technician
+    /// @return averageRating Average rating, ratingCount Number of ratings
     function getLabTechRating(address _labTech) 
         external 
         view 
@@ -445,6 +556,9 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
         averageRating = labTechRatingSum[_labTech].div(ratingCount);
     }
 
+    /// @notice Retrieves the average rating and count for a pharmacy
+    /// @param _pharmacy Address of the pharmacy
+    /// @return averageRating Average rating, ratingCount Number of ratings
     function getPharmacyRating(address _pharmacy) 
         external 
         view 
@@ -457,25 +571,66 @@ contract TelemedicineMedicalServices is Initializable, ReentrancyGuardUpgradeabl
     }
 
     // Callback Functions
-    function notifyDisputeResolved(uint256 _serviceId, string memory _serviceType, TelemedicineMedicalCore.DisputeOutcome _outcome) external onlyMedicalCore {
+
+    /// @notice Notifies and updates the contract when a dispute is resolved
+    /// @param _serviceId ID of the service
+    /// @param _serviceType Type of service ("Appointment", "LabTest", or "Prescription")
+    /// @param _outcome Outcome of the dispute
+    function notifyDisputeResolved(
+        uint256 _serviceId, 
+        string memory _serviceType, 
+        TelemedicineMedicalCore.DisputeOutcome _outcome
+    ) external onlyMedicalCore {
+        if (_serviceId == 0) revert InvalidIndex();
+        
+        if (keccak256(abi.encodePacked(_serviceType)) == keccak256(abi.encodePacked("Appointment"))) {
+            TelemedicineMedicalCore.Appointment storage apt = medicalCore.appointments(_serviceId);
+            if (apt.status != TelemedicineMedicalCore.AppointmentStatus.Disputed) revert InvalidStatus();
+            apt.disputeOutcome = _outcome;
+            apt.status = TelemedicineMedicalCore.AppointmentStatus.Completed; // Revert to Completed post-resolution
+        } 
+        else if (keccak256(abi.encodePacked(_serviceType)) == keccak256(abi.encodePacked("LabTest"))) {
+            TelemedicineMedicalCore.LabTestOrder storage order = medicalCore.labTestOrders(_serviceId);
+            if (order.status != TelemedicineMedicalCore.LabTestStatus.Disputed) revert InvalidStatus();
+            order.disputeOutcome = _outcome;
+            order.status = TelemedicineMedicalCore.LabTestStatus.Reviewed; // Revert to Reviewed post-resolution
+        } 
+        else if (keccak256(abi.encodePacked(_serviceType)) == keccak256(abi.encodePacked("Prescription"))) {
+            TelemedicineMedicalCore.Prescription storage prescription = medicalCore.prescriptions(_serviceId);
+            if (prescription.status != TelemedicineMedicalCore.PrescriptionStatus.Disputed) revert InvalidStatus();
+            prescription.disputeOutcome = _outcome;
+            prescription.status = TelemedicineMedicalCore.PrescriptionStatus.Fulfilled; // Revert to Fulfilled post-resolution
+        } 
+        else {
+            revert InvalidStatus();
+        }
+
         emit DisputeResolved(_serviceId, _serviceType, _outcome);
     }
 
+    /// @notice Notifies the contract of a data reward claim
+    /// @param _patient Address of the patient
+    /// @param _amount Amount of the reward
     function notifyDataRewardClaimed(address _patient, uint256 _amount) external onlyMedicalCore {
         emit DataRewardClaimed(_patient, _amount);
     }
 
     // Modifiers
+
+    /// @notice Restricts access to a specific role
+    /// @param role The role required to call the function
     modifier onlyRole(bytes32 role) {
         if (!core.hasRole(role, msg.sender)) revert NotAuthorized();
         _;
     }
 
+    /// @notice Ensures the contract is not paused
     modifier whenNotPaused() {
         if (core.paused()) revert ContractPaused();
         _;
     }
 
+    /// @notice Restricts access to the TelemedicineMedicalCore contract
     modifier onlyMedicalCore() {
         if (msg.sender != address(medicalCore)) revert NotAuthorized();
         _;
