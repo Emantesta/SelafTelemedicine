@@ -2,15 +2,18 @@
 pragma solidity 0.8.20;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import {SafeMathUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import {TelemedicineCore} from "./TelemedicineCore.sol";
 import {TelemedicineDisputeResolution} from "./TelemedicineDisputeResolution.sol";
+import {TelemedicineOperations} from "./TelemedicineOperations.sol";
 
-contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
+contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
     using SafeMathUpgradeable for uint256;
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
@@ -25,6 +28,7 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
 
     TelemedicineCore public core;
     TelemedicineDisputeResolution public disputeResolution;
+    TelemedicineOperations public operations;
     IERC20Upgradeable public usdcToken;
     IERC20Upgradeable public sonicToken;
     AggregatorV3Interface public ethUsdPriceFeed;
@@ -47,7 +51,7 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
         uint256 amount;
         PaymentType paymentType;
         bool processed;
-        uint48 requestTimestamp; // Added for timeout tracking
+        uint48 requestTimestamp;
     }
     mapping(uint256 => PendingPayment) public pendingPayments;
     uint256 public pendingPaymentCounter;
@@ -78,10 +82,10 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
         string bankDetails;
     }
 
-    // Constants for improvements
-    uint256 public constant MAX_FEE_CAP = 0.01 ether; // Cap for dynamic fees
-    uint48 public constant MAX_STALENESS = 1 hours; // Maximum allowed staleness for price feeds
-    uint48 public constant PENDING_PAYMENT_TIMEOUT = 7 days; // Timeout for pending payments
+    // Constants
+    uint256 public constant MAX_FEE_CAP = 0.01 ether;
+    uint48 public constant MAX_STALENESS = 1 hours;
+    uint48 public constant PENDING_PAYMENT_TIMEOUT = 7 days;
 
     event OnRampRequested(uint256 indexed requestId, address indexed user, uint256 fiatAmount, PaymentType targetToken, string providerReference);
     event OnRampFulfilled(uint256 indexed requestId, address indexed user, uint256 cryptoAmount);
@@ -98,17 +102,66 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     event PaymentQueued(uint256 indexed paymentId, address recipient, uint256 amount, PaymentType paymentType);
     event PaymentReleasedFromQueue(uint256 indexed paymentId, address recipient, uint256 amount);
     event PendingPaymentCleaned(uint256 indexed paymentId, address recipient, uint256 amount);
+    event ReserveFundAllocated(uint256 indexed operationId, uint256 amount, PaymentType paymentType);
+    event PlatformFeeAllocated(uint256 indexed operationId, uint256 amount, PaymentType paymentType);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// @notice Initializes the contract with external dependencies and default settings
+    function initialize(
+        address _core,
+        address _usdcToken,
+        address _sonicToken,
+        address _ethUsdPriceFeed,
+        address _sonicUsdPriceFeed,
+        address _usdFiatOracle,
+        address _onRampProvider,
+        address _offRampProvider,
+        address _disputeResolution,
+        address _operations
+    ) external initializer {
+        if (_core == address(0) || _usdcToken == address(0) || _sonicToken == address(0) ||
+            _ethUsdPriceFeed == address(0) || _sonicUsdPriceFeed == address(0) || _usdFiatOracle == address(0) ||
+            _onRampProvider == address(0) || _offRampProvider == address(0) || _disputeResolution == address(0) ||
+            _operations == address(0)) revert InvalidAddress();
+
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
+        __Pausable_init();
+
+        core = TelemedicineCore(_core);
+        usdcToken = IERC20Upgradeable(_usdcToken);
+        sonicToken = IERC20Upgradeable(_sonicToken);
+        ethUsdPriceFeed = AggregatorV3Interface(_ethUsdPriceFeed);
+        sonicUsdPriceFeed = AggregatorV3Interface(_sonicUsdPriceFeed);
+        usdFiatOracle = AggregatorV3Interface(_usdFiatOracle);
+        onRampProvider = _onRampProvider;
+        offRampProvider = _offRampProvider;
+        disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
+        operations = TelemedicineOperations(_operations);
+        trustedOracles.push(_ethUsdPriceFeed);
+        trustedOracles.push(_sonicUsdPriceFeed);
+        trustedOracles.push(_usdFiatOracle);
+        onRampFee = 0.001 ether;
+        offRampFee = 0.002 ether;
+        onRampCounter = 0;
+        offRampCounter = 0;
+        pendingPaymentCounter = 0;
+    }
+
+    /// @notice Authorizes an upgrade to a new implementation
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(core.ADMIN_ROLE()) {}
 
     /// @notice Queues a payment when funds are insufficient
-    /// @param _recipient Address to receive the payment
-    /// @param _amount Amount to queue
-    /// @param _paymentType Type of payment (ETH, USDC, SONIC)
-    /// @param _timestamp Timestamp of the request
     function queuePayment(address _recipient, uint256 _amount, PaymentType _paymentType, uint48 _timestamp) 
         external 
         nonReentrant 
         whenNotPaused 
     {
+        if (msg.sender != address(operations) && !core.hasRole(core.ADMIN_ROLE(), msg.sender)) revert NotAuthorized();
         if (_recipient == address(0)) revert InvalidAddress();
         if (_amount == 0) revert InsufficientFunds();
         
@@ -123,56 +176,14 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
         emit PaymentQueued(pendingPaymentCounter, _recipient, _amount, _paymentType);
     }
 
-    /// @notice Initializes the contract with external dependencies and default settings
-    /// @param _core Address of the TelemedicineCore contract
-    /// @param _usdcToken Address of the USDC token contract
-    /// @param _sonicToken Address of the SONIC token contract
-    /// @param _ethUsdPriceFeed Address of the ETH/USD Chainlink price feed
-    /// @param _sonicUsdPriceFeed Address of the SONIC/USD Chainlink price feed
-    /// @param _usdFiatOracle Address of the USD/Fiat Chainlink price feed
-    /// @param _onRampProvider Address of the on-ramp provider
-    /// @param _offRampProvider Address of the off-ramp provider
-    /// @param _disputeResolution Address of the dispute resolution contract
-    function initialize(
-        address _core,
-        address _usdcToken,
-        address _sonicToken,
-        address _ethUsdPriceFeed,
-        address _sonicUsdPriceFeed,
-        address _usdFiatOracle,
-        address _onRampProvider,
-        address _offRampProvider,
-        address _disputeResolution
-    ) external initializer {
-        if (_core == address(0) || _usdcToken == address(0) || _sonicToken == address(0) ||
-            _ethUsdPriceFeed == address(0) || _sonicUsdPriceFeed == address(0) || _usdFiatOracle == address(0) ||
-            _onRampProvider == address(0) || _offRampProvider == address(0) || _disputeResolution == address(0)) revert InvalidAddress();
-
-        __ReentrancyGuard_init();
-        core = TelemedicineCore(_core);
-        usdcToken = IERC20Upgradeable(_usdcToken);
-        sonicToken = IERC20Upgradeable(_sonicToken);
-        ethUsdPriceFeed = AggregatorV3Interface(_ethUsdPriceFeed);
-        sonicUsdPriceFeed = AggregatorV3Interface(_sonicUsdPriceFeed);
-        usdFiatOracle = AggregatorV3Interface(_usdFiatOracle);
-        onRampProvider = _onRampProvider;
-        offRampProvider = _offRampProvider;
-        disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
-        trustedOracles.push(_ethUsdPriceFeed);
-        trustedOracles.push(_sonicUsdPriceFeed);
-        trustedOracles.push(_usdFiatOracle);
-        onRampFee = 0.001 ether;
-        offRampFee = 0.002 ether;
-        onRampCounter = 0;
-        offRampCounter = 0;
-        pendingPaymentCounter = 0;
-    }
-
     /// @notice Requests an on-ramp operation to convert fiat to cryptocurrency
-    /// @param _fiatAmount Amount of fiat to convert
-    /// @param _targetToken Target cryptocurrency (ETH, USDC, SONIC)
-    /// @param _providerReference Reference string for the on-ramp provider
-    function requestOnRamp(uint256 _fiatAmount, PaymentType _targetToken, string calldata _providerReference) external payable onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
+    function requestOnRamp(uint256 _fiatAmount, PaymentType _targetToken, string calldata _providerReference) 
+        external 
+        payable 
+        onlyRole(core.PATIENT_ROLE()) 
+        nonReentrant 
+        whenNotPaused 
+    {
         uint256 dynamicFee = _calculateDynamicFee(onRampFee);
         if (_fiatAmount == 0) revert InsufficientFunds();
         if (msg.value < dynamicFee) revert InsufficientFunds();
@@ -192,15 +203,18 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
 
         _safeTransferETH(onRampProvider, dynamicFee);
         if (msg.value > dynamicFee) {
-            _safeTransferETH(msg.sender, msg.value.sub(dynamicFee)); // Refund excess ETH
+            _safeTransferETH(msg.sender, msg.value.sub(dynamicFee));
         }
         emit OnRampRequested(onRampCounter, msg.sender, _fiatAmount, _targetToken, _providerReference);
     }
 
-    /// @notice Fulfills an on-ramp request, delivering cryptocurrency to the user
-    /// @param _requestId ID of the on-ramp request
-    /// @param _oracleSignatures Signatures from trusted oracles for consensus
-    function fulfillOnRamp(uint256 _requestId, bytes[] calldata _oracleSignatures) external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused {
+    /// @notice Fulfills an on-ramp request
+    function fulfillOnRamp(uint256 _requestId, bytes[] calldata _oracleSignatures) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+        nonReentrant 
+        whenNotPaused 
+    {
         OnRampRequest storage request = onRampRequests[_requestId];
         if (request.status != OnRampStatus.Pending) revert InvalidStatus();
         if (!_verifyMultiOracleConsensus(_requestId, request.cryptoAmount, _oracleSignatures)) revert NotAuthorized();
@@ -211,9 +225,11 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Marks an on-ramp request as failed
-    /// @param _requestId ID of the on-ramp request
-    /// @param _reason Reason for the failure
-    function failOnRamp(uint256 _requestId, string calldata _reason) external onlyRole(core.ADMIN_ROLE()) whenNotPaused {
+    function failOnRamp(uint256 _requestId, string calldata _reason) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+        whenNotPaused 
+    {
         OnRampRequest storage request = onRampRequests[_requestId];
         if (request.status != OnRampStatus.Pending) revert InvalidStatus();
         request.status = OnRampStatus.Failed;
@@ -221,10 +237,13 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Requests an off-ramp operation to convert cryptocurrency to fiat
-    /// @param _sourceToken Source cryptocurrency (ETH, USDC, SONIC)
-    /// @param _cryptoAmount Amount of cryptocurrency to convert
-    /// @param _bankDetails Bank details for fiat delivery
-    function requestOffRamp(PaymentType _sourceToken, uint256 _cryptoAmount, string calldata _bankDetails) external payable onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
+    function requestOffRamp(PaymentType _sourceToken, uint256 _cryptoAmount, string calldata _bankDetails) 
+        external 
+        payable 
+        onlyRole(core.PATIENT_ROLE()) 
+        nonReentrant 
+        whenNotPaused 
+    {
         uint256 dynamicFee = _calculateDynamicFee(offRampFee);
         if (_cryptoAmount == 0) revert InsufficientFunds();
         if (msg.value < dynamicFee) revert InsufficientFunds();
@@ -234,7 +253,7 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
             uint256 requiredEth = _cryptoAmount.add(dynamicFee);
             if (msg.value < requiredEth) revert InsufficientFunds();
             if (msg.value > requiredEth) {
-                _safeTransferETH(msg.sender, msg.value.sub(requiredEth)); // Refund excess ETH
+                _safeTransferETH(msg.sender, msg.value.sub(requiredEth));
             }
         } else if (_sourceToken == PaymentType.USDC) {
             usdcToken.safeTransferFrom(msg.sender, address(this), _cryptoAmount);
@@ -259,8 +278,12 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Locks an off-ramp request for processing
-    /// @param _requestId ID of the off-ramp request
-    function lockOffRamp(uint256 _requestId) external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused {
+    function lockOffRamp(uint256 _requestId) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+        nonReentrant 
+        whenNotPaused 
+    {
         OffRampRequest storage request = offRampRequests[_requestId];
         if (request.status != OffRampStatus.Pending) revert InvalidStatus();
         request.status = OffRampStatus.Locked;
@@ -268,9 +291,12 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Fulfills a locked off-ramp request
-    /// @param _requestId ID of the off-ramp request
-    /// @param _oracleSignatures Signatures from trusted oracles for consensus
-    function fulfillOffRamp(uint256 _requestId, bytes[] calldata _oracleSignatures) external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused {
+    function fulfillOffRamp(uint256 _requestId, bytes[] calldata _oracleSignatures) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+        nonReentrant 
+        whenNotPaused 
+    {
         OffRampRequest storage request = offRampRequests[_requestId];
         if (request.status != OffRampStatus.Locked) revert InvalidStatus();
         if (!_verifyMultiOracleConsensus(_requestId, request.fiatAmount, _oracleSignatures)) revert NotAuthorized();
@@ -280,9 +306,12 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Marks an off-ramp request as failed and refunds the user
-    /// @param _requestId ID of the off-ramp request
-    /// @param _reason Reason for the failure
-    function failOffRamp(uint256 _requestId, string calldata _reason) external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused {
+    function failOffRamp(uint256 _requestId, string calldata _reason) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+        nonReentrant 
+        whenNotPaused 
+    {
         OffRampRequest storage request = offRampRequests[_requestId];
         if (request.status != OffRampStatus.Pending && request.status != OffRampStatus.Locked) revert InvalidStatus();
         request.status = OffRampStatus.Failed;
@@ -292,7 +321,6 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Updates the on-ramp provider address
-    /// @param _newProvider New on-ramp provider address
     function updateOnRampProvider(address _newProvider) external onlyRole(core.ADMIN_ROLE()) {
         if (_newProvider == address(0)) revert InvalidAddress();
         address oldProvider = onRampProvider;
@@ -301,7 +329,6 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Updates the off-ramp provider address
-    /// @param _newProvider New off-ramp provider address
     function updateOffRampProvider(address _newProvider) external onlyRole(core.ADMIN_ROLE()) {
         if (_newProvider == address(0)) revert InvalidAddress();
         address oldProvider = offRampProvider;
@@ -310,7 +337,6 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Updates the ETH/USD price feed address
-    /// @param _newFeed New ETH/USD price feed address
     function updateEthUsdPriceFeed(address _newFeed) external onlyRole(core.ADMIN_ROLE()) {
         if (_newFeed == address(0)) revert InvalidAddress();
         address oldFeed = address(ethUsdPriceFeed);
@@ -320,7 +346,6 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Updates the SONIC/USD price feed address
-    /// @param _newFeed New SONIC/USD price feed address
     function updateSonicUsdPriceFeed(address _newFeed) external onlyRole(core.ADMIN_ROLE()) {
         if (_newFeed == address(0)) revert InvalidAddress();
         address oldFeed = address(sonicUsdPriceFeed);
@@ -330,7 +355,6 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Updates the USD/Fiat oracle address
-    /// @param _newOracle New USD/Fiat oracle address
     function updateUsdFiatOracle(address _newOracle) external onlyRole(core.ADMIN_ROLE()) {
         if (_newOracle == address(0)) revert InvalidAddress();
         address oldFeed = address(usdFiatOracle);
@@ -340,8 +364,6 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Updates the on-ramp or off-ramp fee
-    /// @param _rampType Type of ramp ("onRamp" or "offRamp")
-    /// @param _newFee New fee amount
     function updateRampFee(string calldata _rampType, uint256 _newFee) external onlyRole(core.ADMIN_ROLE()) {
         bytes32 rampHash = keccak256(abi.encodePacked(_rampType));
         if (rampHash == keccak256("onRamp")) {
@@ -357,34 +379,49 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
         }
     }
 
-    /// @notice Processes a payment in USDC or SONIC tokens
-    /// @param _type Payment type (USDC or SONIC)
-    /// @param _amount Amount to transfer
-    function _processPayment(PaymentType _type, uint256 _amount) external nonReentrant whenNotPaused {
-        if (_type == PaymentType.USDC) {
+    /// @notice Processes a payment in ETH, USDC, or SONIC tokens
+    function _processPayment(PaymentType _type, uint256 _amount) external payable nonReentrant whenNotPaused {
+        if (msg.sender != address(operations)) revert NotAuthorized();
+        uint256 reserveAmount = _amount.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
+        uint256 platformAmount = _amount.mul(core.platformFeePercentage()).div(core.PERCENTAGE_DENOMINATOR());
+        uint256 operationId = operations.getOperationId(msg.sender, block.timestamp); // Assumed function from TelemedicineOperations
+
+        if (_type == PaymentType.ETH) {
+            if (msg.value < _amount) revert InsufficientFunds();
+            core.reserveFund = core.reserveFund.add(reserveAmount);
+            if (msg.value > _amount) {
+                _safeTransferETH(msg.sender, msg.value.sub(_amount));
+            }
+        } else if (_type == PaymentType.USDC) {
             usdcToken.safeTransferFrom(msg.sender, address(this), _amount);
+            usdcToken.safeTransfer(address(this), reserveAmount);
+            core.reserveFund = core.reserveFund.add(reserveAmount);
         } else if (_type == PaymentType.SONIC) {
             sonicToken.safeTransferFrom(msg.sender, address(this), _amount);
+            sonicToken.safeTransfer(address(this), reserveAmount);
+            core.reserveFund = core.reserveFund.add(reserveAmount);
         } else {
             revert InvalidStatus();
         }
+
+        emit ReserveFundAllocated(operationId, reserveAmount, _type);
+        emit PlatformFeeAllocated(operationId, platformAmount, _type);
     }
 
     /// @notice Refunds a patient from the reserve fund
-    /// @param _patient Address of the patient to refund
-    /// @param _amount Amount to refund
-    /// @param _type Payment type (ETH, USDC, SONIC)
-    /// @param _disputeId ID of the dispute triggering the refund
-    function refundPatient(address _patient, uint256 _amount, PaymentType _type, uint256 _disputeId) external onlyDisputeResolution nonReentrant whenNotPaused {
+    function refundPatient(address _patient, uint256 _amount, PaymentType _type, uint256 _disputeId) 
+        public 
+        onlyDisputeResolution 
+        nonReentrant 
+        whenNotPaused 
+    {
         if (_amount == 0) return;
-        if (core.getReserveFundBalance() < core.RESERVE_FUND_THRESHOLD()) revert InsufficientFunds();
+        if (core.getReserveFundBalance() < core.minReserveBalance()) revert InsufficientFunds();
         _releasePayment(_patient, _amount, _type);
         emit PatientRefunded(_disputeId, _patient, _amount, _type);
     }
 
     /// @notice Releases queued payments when funds are available
-    /// @param _startId Starting ID of payments to process
-    /// @param _count Number of payments to process
     function releasePendingPayments(uint256 _startId, uint256 _count) external onlyRole(core.ADMIN_ROLE()) nonReentrant {
         uint256 endId = _startId.add(_count) > pendingPaymentCounter ? pendingPaymentCounter : _startId.add(_count);
         for (uint256 i = _startId; i < endId; i++) {
@@ -399,9 +436,7 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
         }
     }
 
-    /// @notice Cleans up stale pending payments older than the timeout period
-    /// @param _startId Starting ID of payments to check
-    /// @param _count Number of payments to check
+    /// @notice Cleans up stale pending payments
     function cleanPendingPayments(uint256 _startId, uint256 _count) external onlyRole(core.ADMIN_ROLE()) nonReentrant {
         uint256 endId = _startId.add(_count) > pendingPaymentCounter ? pendingPaymentCounter : _startId.add(_count);
         for (uint256 i = _startId; i < endId; i++) {
@@ -414,6 +449,7 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
         }
     }
 
+    // Internal Functions
     function _calculateCryptoAmount(uint256 _fiatAmount, PaymentType _targetToken) internal view returns (uint256) {
         (, int256 usdPrice, , uint256 updatedAt, ) = usdFiatOracle.latestRoundData();
         if (usdPrice <= 0 || block.timestamp > updatedAt + MAX_STALENESS) revert StalePriceFeed();
@@ -533,6 +569,7 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
         return ecrecover(message, v, r, s);
     }
 
+    // Modifiers
     modifier onlyRole(bytes32 role) {
         if (!core.hasRole(role, msg.sender)) revert NotAuthorized();
         _;
@@ -548,5 +585,6 @@ contract TelemedicinePayments is Initializable, ReentrancyGuardUpgradeable {
         _;
     }
 
+    // Fallback
     receive() external payable {}
 }
