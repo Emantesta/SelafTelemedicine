@@ -10,6 +10,7 @@ import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {TelemedicineCore} from "./TelemedicineCore.sol";
 import {TelemedicinePayments} from "./TelemedicinePayments.sol";
+import {TelemedicineOperations} from "./TelemedicineOperations.sol";
 
 contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
     using SafeMathUpgradeable for uint256;
@@ -17,6 +18,7 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
 
     TelemedicineCore public core;
     TelemedicinePayments public payments;
+    TelemedicineOperations public operations;
 
     // Configurable Payment Parameters
     uint96 public monthlyFeeUSDC; // $20 in USDC (6 decimals)
@@ -42,7 +44,6 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
 
     // Mappings
     mapping(address => Subscription) public subscriptions;
-    mapping(address => uint256) public patientConsults;
     mapping(uint256 => TelemedicinePayments.PendingPayment) public pendingPayments;
     uint256 public pendingPaymentCounter;
 
@@ -55,18 +56,23 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
     event PaymentMethodRemoved(string methodName);
     event PaymentQueued(uint256 indexed paymentId, address recipient, uint256 amount, TelemedicinePayments.PaymentType paymentType);
     event PaymentReleasedFromQueue(uint256 indexed paymentId, address recipient, uint256 amount);
+    event DepositReceived(address indexed sender, uint256 amount);
+    event ReserveFundAllocated(uint256 indexed operationId, uint256 amount, TelemedicinePayments.PaymentType paymentType);
+    event PlatformFeeAllocated(uint256 indexed operationId, uint256 amount, TelemedicinePayments.PaymentType paymentType);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
-    /// @notice Initializes the contract with core and payments addresses
+    /// @notice Initializes the contract with core, payments, and operations addresses
     /// @param _core Address of the TelemedicineCore contract
     /// @param _payments Address of the TelemedicinePayments contract
-    function initialize(address _core, address _payments) external initializer {
+    /// @param _operations Address of the TelemedicineOperations contract
+    function initialize(address _core, address _payments, address _operations) external initializer {
         if (_core == address(0)) revert TelemedicinePayments.InvalidAddress();
         if (_payments == address(0)) revert TelemedicinePayments.InvalidAddress();
+        if (_operations == address(0)) revert TelemedicinePayments.InvalidAddress();
 
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
@@ -74,6 +80,7 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
 
         core = TelemedicineCore(_core);
         payments = TelemedicinePayments(_payments);
+        operations = TelemedicineOperations(_operations);
 
         monthlyFeeUSDC = 20 * 10**6; // $20 in USDC
         annualFeeUSDC = 200 * 10**6; // $200 in USDC
@@ -88,44 +95,60 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         pendingPaymentCounter = 0;
     }
 
+    /// @notice Authorizes an upgrade to a new implementation
+    /// @param newImplementation Address of the new contract implementation
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(core.ADMIN_ROLE()) {}
 
     // Config setters (onlyAdmin)
+    /// @notice Sets the monthly subscription fee in USDC
+    /// @param _fee New fee amount in USDC (6 decimals)
     function setMonthlyFeeUSDC(uint96 _fee) external onlyRole(core.ADMIN_ROLE()) {
         if (_fee == 0) revert TelemedicinePayments.InvalidStatus();
         monthlyFeeUSDC = _fee;
         emit ConfigurationUpdated("monthlyFeeUSDC", _fee);
     }
 
+    /// @notice Sets the annual subscription fee in USDC
+    /// @param _fee New fee amount in USDC (6 decimals)
     function setAnnualFeeUSDC(uint96 _fee) external onlyRole(core.ADMIN_ROLE()) {
         if (_fee == 0) revert TelemedicinePayments.InvalidStatus();
         annualFeeUSDC = _fee;
         emit ConfigurationUpdated("annualFeeUSDC", _fee);
     }
 
+    /// @notice Sets the per-consultation fee in USDC
+    /// @param _fee New fee amount in USDC (6 decimals)
     function setPerConsultFeeUSDC(uint96 _fee) external onlyRole(core.ADMIN_ROLE()) {
         if (_fee == 0) revert TelemedicinePayments.InvalidStatus();
         perConsultFeeUSDC = _fee;
         emit ConfigurationUpdated("perConsultFeeUSDC", _fee);
     }
 
+    /// @notice Sets the maximum number of consultations per subscription period
+    /// @param _limit New consultation limit
     function setSubscriptionConsultsLimit(uint8 _limit) external onlyRole(core.ADMIN_ROLE()) {
         subscriptionConsultsLimit = _limit;
         emit ConfigurationUpdated("subscriptionConsultsLimit", _limit);
     }
 
+    /// @notice Sets the duration of a month in seconds
+    /// @param _duration New month duration in seconds
     function setMonthDuration(uint256 _duration) external onlyRole(core.ADMIN_ROLE()) {
         if (_duration == 0) revert TelemedicinePayments.InvalidStatus();
         monthDuration = _duration;
         emit ConfigurationUpdated("monthDuration", _duration);
     }
 
+    /// @notice Adds a new supported payment method
+    /// @param _methodName Name of the payment method (e.g., "ETH", "USDC")
     function addPaymentMethod(string memory _methodName) external onlyRole(core.ADMIN_ROLE()) {
         if (isPaymentMethodSupported[_methodName]) revert TelemedicinePayments.InvalidStatus();
         isPaymentMethodSupported[_methodName] = true;
         emit PaymentMethodAdded(_methodName);
     }
 
+    /// @notice Removes a supported payment method
+    /// @param _methodName Name of the payment method to remove
     function removePaymentMethod(string memory _methodName) external onlyRole(core.ADMIN_ROLE()) {
         if (!isPaymentMethodSupported[_methodName]) revert TelemedicinePayments.InvalidStatus();
         isPaymentMethodSupported[_methodName] = false;
@@ -135,6 +158,8 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
     /// @notice Subscribes a patient to a plan
     /// @param isAnnual True for annual plan, false for monthly
     function subscribe(bool isAnnual) external payable onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
+        if (!core.patients(msg.sender).isRegistered) revert TelemedicinePayments.NotAuthorized();
+
         uint256 baseFee = isAnnual ? annualFeeUSDC : monthlyFeeUSDC;
         uint256 duration = isAnnual ? YEAR_DURATION : monthDuration;
         uint256 discountedFee = _applyFeeDiscount(msg.sender, baseFee);
@@ -143,7 +168,23 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         if (!isPaymentMethodSupported[paymentType == TelemedicinePayments.PaymentType.ETH ? "ETH" : paymentType == TelemedicinePayments.PaymentType.USDC ? "USDC" : "SONIC"]) 
             revert TelemedicinePayments.InvalidStatus();
 
+        uint256 reserveAmount = discountedFee.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
+        uint256 platformAmount = discountedFee.mul(core.platformFeePercentage()).div(core.PERCENTAGE_DENOMINATOR());
+
         _processPayment(paymentType, discountedFee);
+
+        if (paymentType == TelemedicinePayments.PaymentType.ETH) {
+            core.reserveFund = core.reserveFund.add(reserveAmount);
+        } else if (paymentType == TelemedicinePayments.PaymentType.USDC) {
+            payments.usdcToken().safeTransfer(address(this), reserveAmount);
+            core.reserveFund = core.reserveFund.add(reserveAmount);
+        } else if (paymentType == TelemedicinePayments.PaymentType.SONIC) {
+            payments.sonicToken().safeTransfer(address(this), reserveAmount);
+            core.reserveFund = core.reserveFund.add(reserveAmount);
+        }
+
+        emit ReserveFundAllocated(0, reserveAmount, paymentType); // 0 as no specific operation ID
+        emit PlatformFeeAllocated(0, platformAmount, paymentType);
 
         Subscription storage sub = subscriptions[msg.sender];
         if (sub.isActive && block.timestamp < sub.expiry) {
@@ -163,12 +204,14 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
                 )
             );
         }
-        core._levelUp(msg.sender); // Use core's level-up function for consistency
+        core._levelUp(msg.sender);
 
         emit Subscribed(msg.sender, isAnnual, sub.expiry);
     }
 
-    // Internal function to check and charge consult
+    /// @dev Checks subscription status and charges for a consultation if necessary
+    /// @param patient Address of the patient
+    /// @return bool True if subscription covers the consult, false if charged separately
     function _checkAndChargeConsult(address patient) internal returns (bool) {
         Subscription storage sub = subscriptions[patient];
 
@@ -193,9 +236,9 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         return false;
     }
 
-    /// @notice Books an appointment with a doctor
+    /// @notice Books an appointment with a doctor via TelemedicineOperations
     /// @param doctorAddress The address of the doctor
-    /// @param paymentMethod The payment method to use
+    /// @param paymentMethod The payment method to use (e.g., "ETH", "USDC", "SONIC")
     /// @param paymentType The type of payment (ETH, USDC, SONIC)
     function bookAppointment(
         address doctorAddress,
@@ -203,8 +246,15 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         TelemedicinePayments.PaymentType paymentType
     ) external payable onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
         if (!core.hasRole(core.DOCTOR_ROLE(), doctorAddress)) revert TelemedicinePayments.NotAuthorized();
+        if (!core.patients(msg.sender).isRegistered) revert TelemedicinePayments.NotAuthorized();
         if (!isPaymentMethodSupported[paymentMethod]) revert TelemedicinePayments.InvalidStatus();
-        if (block.timestamp < core.minBookingBuffer()) revert TelemedicinePayments.InvalidTimestamp();
+
+        // Validate paymentMethod matches paymentType
+        if (
+            (paymentType == TelemedicinePayments.PaymentType.ETH && keccak256(abi.encodePacked(paymentMethod)) != keccak256(abi.encodePacked("ETH"))) ||
+            (paymentType == TelemedicinePayments.PaymentType.USDC && keccak256(abi.encodePacked(paymentMethod)) != keccak256(abi.encodePacked("USDC"))) ||
+            (paymentType == TelemedicinePayments.PaymentType.SONIC && keccak256(abi.encodePacked(paymentMethod)) != keccak256(abi.encodePacked("SONIC")))
+        ) revert TelemedicinePayments.InvalidStatus();
 
         TelemedicineCore.Doctor memory doctor = core.doctors(doctorAddress);
         uint256 baseFee = doctor.consultationFee;
@@ -212,20 +262,44 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         if (discountedFee > type(uint96).max) revert TelemedicinePayments.InsufficientFunds();
 
         bool usedSubscription = _checkAndChargeConsult(msg.sender);
+        uint256 reserveAmount = discountedFee.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
+        uint256 platformAmount = discountedFee.mul(core.platformFeePercentage()).div(core.PERCENTAGE_DENOMINATOR());
 
         if (!usedSubscription) {
             _processPayment(paymentType, discountedFee);
+
+            if (paymentType == TelemedicinePayments.PaymentType.ETH) {
+                core.reserveFund = core.reserveFund.add(reserveAmount);
+            } else if (paymentType == TelemedicinePayments.PaymentType.USDC) {
+                payments.usdcToken().safeTransfer(address(this), reserveAmount);
+                core.reserveFund = core.reserveFund.add(reserveAmount);
+            } else if (paymentType == TelemedicinePayments.PaymentType.SONIC) {
+                payments.sonicToken().safeTransfer(address(this), reserveAmount);
+                core.reserveFund = core.reserveFund.add(reserveAmount);
+            }
+
+            emit ReserveFundAllocated(operations.appointmentCounter() + 1, reserveAmount, paymentType);
+            emit PlatformFeeAllocated(operations.appointmentCounter() + 1, platformAmount, paymentType);
             emit ConsultCharged(msg.sender, discountedFee, paymentMethod);
         }
 
-        unchecked { patientConsults[msg.sender] = patientConsults[msg.sender].add(1); }
+        address[] memory doctors = new address[](1);
+        doctors[0] = doctorAddress;
+        operations.bookAppointment{value: paymentType == TelemedicinePayments.PaymentType.ETH ? msg.value : 0}(
+            doctors,
+            uint48(block.timestamp + core.minBookingBuffer()),
+            paymentType,
+            false, // No video call by default
+            ""     // No video call link
+        );
+
         TelemedicineCore.GamificationData storage gamification = core.patients(msg.sender).gamification;
         unchecked {
             gamification.mediPoints = uint96(
                 gamification.mediPoints.add(core.pointsForActions("appointment"))
             );
         }
-        core._levelUp(msg.sender); // Use core's level-up function
+        core._levelUp(msg.sender);
 
         emit AppointmentBooked(msg.sender, doctorAddress, usedSubscription ? "Subscription" : paymentMethod);
     }
@@ -255,9 +329,10 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         _releasePayment(to, amount, paymentType);
     }
 
-    /// @notice Deposits ETH into the contract (restricted to payments)
+    /// @notice Deposits ETH into the contract
+    /// @dev Restricted to patients when not paused
     function deposit() external payable onlyRole(core.PATIENT_ROLE()) whenNotPaused {
-        // No additional logic needed; ETH is received and tracked via balance
+        emit DepositReceived(msg.sender, msg.value);
     }
 
     /// @notice Releases a queued payment
@@ -273,10 +348,17 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
     }
 
     // Internal Functions
+    /// @dev Applies a discount to a fee based on patient status
+    /// @param _patient Address of the patient
+    /// @param _baseFee Base fee before discount
+    /// @return Discounted fee amount
     function _applyFeeDiscount(address _patient, uint256 _baseFee) internal view returns (uint256) {
-        return core._applyFeeDiscount(_patient, _baseFee); // Delegate to core for consistency
+        return core._applyFeeDiscount(_patient, _baseFee);
     }
 
+    /// @dev Processes a payment based on the payment type
+    /// @param _type Type of payment (ETH, USDC, SONIC)
+    /// @param _amount Amount to process
     function _processPayment(TelemedicinePayments.PaymentType _type, uint256 _amount) internal {
         if (_type == TelemedicinePayments.PaymentType.ETH) {
             if (msg.value < _amount) revert TelemedicinePayments.InsufficientFunds();
@@ -292,6 +374,10 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         }
     }
 
+    /// @dev Releases a payment to a recipient
+    /// @param _to Recipient address
+    /// @param _amount Amount to release
+    /// @param _paymentType Type of payment (ETH, USDC, SONIC)
     function _releasePayment(address _to, uint256 _amount, TelemedicinePayments.PaymentType _paymentType) internal {
         if (!_hasSufficientFunds(_amount, _paymentType)) {
             pendingPaymentCounter = pendingPaymentCounter.add(1);
@@ -309,6 +395,10 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         }
     }
 
+    /// @dev Checks if the contract has sufficient funds for a payment
+    /// @param _amount Amount to check
+    /// @param _paymentType Type of payment (ETH, USDC, SONIC)
+    /// @return bool True if sufficient funds are available
     function _hasSufficientFunds(uint256 _amount, TelemedicinePayments.PaymentType _paymentType) internal view returns (bool) {
         if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
             return address(this).balance >= _amount;
@@ -320,14 +410,19 @@ contract TelemedicineSubscription is Initializable, UUPSUpgradeable, ReentrancyG
         return false;
     }
 
+    /// @dev Safely transfers ETH to an address
+    /// @param _to Recipient address
+    /// @param _amount Amount of ETH to transfer
     function _safeTransferETH(address _to, uint256 _amount) internal {
         (bool success, ) = _to.call{value: _amount}("");
         if (!success) revert TelemedicinePayments.PaymentFailed();
     }
 
     // Fallback function restricted to deposit
+    /// @notice Receives ETH deposits from patients
     receive() external payable {
         if (!core.hasRole(core.PATIENT_ROLE(), msg.sender) || core.paused()) revert TelemedicinePayments.NotAuthorized();
+        emit DepositReceived(msg.sender, msg.value);
     }
 
     // Modifiers
