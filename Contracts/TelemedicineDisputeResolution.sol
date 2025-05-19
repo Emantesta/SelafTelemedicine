@@ -6,21 +6,28 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import {SafeMathUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {TelemedicineCore} from "./TelemedicineCore.sol";
 import {TelemedicineGovernanceCore} from "./TelemedicineGovernanceCore.sol";
 import {TelemedicinePayments} from "./TelemedicinePayments.sol";
 import {TelemedicineMedicalCore} from "./TelemedicineMedicalCore.sol";
 import {LinkTokenInterface} from "@chainlink/contracts/src/v0.8/interfaces/LinkTokenInterface.sol";
 import {ChainlinkClient} from "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import {ITelemedicinePayments} from "./Interfaces/ITelemedicinePayments.sol";
 
+/// @title TelemedicineDisputeResolution
+/// @notice Manages disputes with Chainlink oracle verification
+/// @dev UUPS upgradeable, integrates with core, governance, payments, and medical contracts
 contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, ChainlinkClient {
     using SafeMathUpgradeable for uint256;
     using Chainlink for Chainlink.Request;
+    using Strings for uint256;
 
-    TelemedicineCore public core;
-    TelemedicineGovernanceCore public governance;
-    TelemedicinePayments public payments;
-    TelemedicineMedicalCore public medical;
+    // Immutable Dependencies
+    TelemedicineCore public immutable core;
+    TelemedicineGovernanceCore public immutable governance;
+    TelemedicinePayments public immutable payments;
+    TelemedicineMedicalCore public immutable medical;
 
     // Chainlink Configuration
     address public chainlinkOracle;
@@ -33,13 +40,22 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
     uint256 public evidenceSubmissionPeriod;
     uint256 public oracleTimeout;
 
-    // Dispute Counter
+    // Counters
     uint256 public disputeCounter;
+    uint256 public versionNumber; // New: Track contract version
+
+    // Constants
+    uint256 public constant MIN_PATIENT_COST = 0.01 * 10**6; // New: 0.01 USDC (6 decimals)
+    uint256 public constant MIN_CHAINLINK_FEE = 0.05 * 10**18; // New: 0.05 LINK
+    uint256 public constant MAX_DISPUTES = 1_000_000; // New: Limit disputes
+    uint256 public constant MAX_RETRIES = 3; // New: Chainlink retry limit
 
     // Dispute Data
-    mapping(uint256 => Dispute) public disputes;
-    mapping(uint256 => mapping(address => bytes32)) public evidenceHashes; // Dispute ID => Party => IPFS Hash
-    mapping(bytes32 => uint256) public chainlinkRequestToDisputeId; // Chainlink request ID => Dispute ID
+    mapping(uint256 => Dispute) private disputes; // Updated: Private
+    mapping(uint256 => mapping(address => bytes32)) private evidenceHashes; // Updated: Private
+    mapping(bytes32 => uint256) private chainlinkRequestToDisputeId; // Updated: Private
+    mapping(uint256 => uint256) public prescriptionToDisputeIds; // New: Map prescription to dispute
+    mapping(uint256 => uint256) public chainlinkRetryCounts; // New: Track retries
 
     // Structs
     struct Dispute {
@@ -49,14 +65,19 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
         address labTechnician;
         address pharmacy;
         DisputeType disputeType;
-        uint256 prescriptionId; // Links to TelemedicineMedicalCore Prescription
-        uint256 patientCost; // Aligned with TelemedicineMedicalCore
-        TelemedicinePayments.PaymentType paymentType;
+        uint256 prescriptionId;
+        uint256 patientCost;
+        ITelemedicinePayments.PaymentType paymentType; // Updated: Use interface
         DisputeStatus status;
         uint48 createdAt;
         uint48 evidenceDeadline;
         bytes32 resolutionReason;
         bool escalated;
+    }
+
+    struct Resolution {
+        bytes32 reasonHash;
+        bytes32 descriptionHash; // New: Additional context
     }
 
     // Enums
@@ -66,35 +87,51 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
     // Events
     event DisputeInitiated(
         uint256 indexed disputeId,
-        address indexed patient,
-        address doctor,
-        address labTechnician,
-        address pharmacy,
+        bytes32 indexed patientHash, // Updated: Hashed address
         DisputeType disputeType,
         uint256 prescriptionId
     );
-    event EvidenceSubmitted(uint256 indexed disputeId, address indexed submitter, bytes32 evidenceHash);
+    event EvidenceSubmitted(uint256 indexed disputeId, bytes32 indexed submitterHash, bytes32 evidenceHash);
     event OracleRequestSent(uint256 indexed disputeId, bytes32 indexed requestId);
     event OracleRequestFailed(uint256 indexed disputeId, string reason);
     event DisputeAutoResolved(uint256 indexed disputeId, bytes32 resolutionReason);
-    event DisputeEscalated(uint256 indexed disputeId, address indexed admin);
+    event DisputeEscalated(uint256 indexed disputeId, bytes32 indexed adminHash);
     event DisputeResolved(uint256 indexed disputeId, bytes32 resolutionReason);
-    event DisputeCancelled(uint256 indexed disputeId, address indexed canceller);
+    event DisputeCancelled(uint256 indexed disputeId, bytes32 indexed cancellerHash);
     event ReplacementOrdered(uint256 indexed disputeId, uint256 newPrescriptionId);
+    event ConfigurationUpdated(string indexed parameter, uint256 value); // New: Unified config event
+    event ChainlinkConfigUpdated(string indexed parameter, address value); // New: Chainlink config event
+
+    // Errors
+    error InvalidAddress();
+    error InvalidDisputeStatus();
+    error UnauthorizedSubmitter();
+    error EvidencePeriodExpired();
+    error InvalidEvidenceHash();
+    error InsufficientLink();
+    error OracleTimeout();
+    error InvalidResolutionReason();
+    error ExternalCallFailed();
+    error CounterOverflow();
+    error InvalidPrescription();
+    error DisputeWindowExpired();
+    error InvalidParty();
+    error InvalidConfiguration();
+    error MaxRetriesExceeded();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
-    /// @notice Initializes the dispute resolution contract with dependencies and Chainlink configuration
-    /// @param _core Address of the TelemedicineCore contract
-    /// @param _governance Address of the TelemedicineGovernanceCore contract
-    /// @param _payments Address of the TelemedicinePayments contract
-    /// @param _medical Address of the TelemedicineMedicalCore contract
-    /// @param _chainlinkOracle Address of the Chainlink oracle
-    /// @param _chainlinkJobId Job ID for Chainlink requests
-    /// @param _linkToken Address of the LINK token contract
+    /// @notice Initializes the contract
+    /// @param _core Core contract address
+    /// @param _governance Governance contract address
+    /// @param _payments Payments contract address
+    /// @param _medical Medical contract address
+    /// @param _chainlinkOracle Chainlink oracle address
+    /// @param _chainlinkJobId Chainlink job ID
+    /// @param _linkToken LINK token address
     function initialize(
         address _core,
         address _governance,
@@ -105,7 +142,9 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
         address _linkToken
     ) external initializer {
         if (_core == address(0) || _governance == address(0) || _payments == address(0) || _medical == address(0) ||
-            _chainlinkOracle == address(0) || _linkToken == address(0)) revert("Invalid address");
+            _chainlinkOracle == address(0) || _linkToken == address(0)) revert InvalidAddress();
+        // Updated: Validate contracts
+        if (!_isContract(_chainlinkOracle) || !_isContract(_linkToken)) revert InvalidAddress();
 
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
@@ -124,19 +163,29 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
         disputeSubmissionPeriod = 7 days;
         evidenceSubmissionPeriod = 48 hours;
         oracleTimeout = 24 hours;
-        chainlinkFee = 0.1 ether; // 0.1 LINK, adjust per network
+        chainlinkFee = 0.1 * 10**18; // 0.1 LINK
+        versionNumber = 1;
     }
 
-    /// @notice Authorizes an upgrade to a new implementation
-    /// @param newImplementation Address of the new implementation contract
-    function _authorizeUpgrade(address newImplementation) internal override onlyRole(core.ADMIN_ROLE()) {}
+    /// @notice Returns the contract version
+    /// @return Version number
+    function version() external view returns (uint256) {
+        return versionNumber;
+    }
 
-    /// @notice Initiates a dispute related to a prescription
-    /// @param _doctor Address of the doctor involved (if applicable)
-    /// @param _labTechnician Address of the lab technician involved (if applicable)
-    /// @param _pharmacy Address of the pharmacy involved (if applicable)
-    /// @param _disputeType Type of dispute (Misdiagnosis, LabError, PharmacyError, PaymentIssue)
-    /// @param _prescriptionId ID of the prescription linked to the dispute
+    /// @notice Authorizes an upgrade
+    /// @param newImplementation New implementation address
+    function _authorizeUpgrade(address newImplementation) internal override onlyConfigAdmin {
+        if (!_isContract(newImplementation)) revert InvalidAddress();
+        versionNumber++;
+    }
+
+    /// @notice Initiates a dispute
+    /// @param _doctor Doctor address
+    /// @param _labTechnician Lab technician address
+    /// @param _pharmacy Pharmacy address
+    /// @param _disputeType Dispute type
+    /// @param _prescriptionId Prescription ID
     function initiateDispute(
         address _doctor,
         address _labTechnician,
@@ -144,17 +193,44 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
         DisputeType _disputeType,
         uint256 _prescriptionId
     ) external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
-        require(
-            (_doctor != address(0) && core.hasRole(core.DOCTOR_ROLE(), _doctor)) ||
-            (_labTechnician != address(0) && core.hasRole(core.LAB_TECH_ROLE(), _labTechnician)) ||
-            (_pharmacy != address(0) && core.hasRole(core.PHARMACY_ROLE(), _pharmacy)),
-            "Invalid party address"
-        );
-        TelemedicineMedicalCore.Prescription memory prescription = medical.prescriptions(_prescriptionId);
-        require(_prescriptionId > 0 && prescription.patient == msg.sender, "Invalid prescription");
-        require(prescription.patientCost > 0, "No payment to dispute");
-        require(block.timestamp <= prescription.disputeWindowEnd, "Dispute window expired");
+        // Updated: Validate parties
+        bool validParty;
+        if (_doctor != address(0)) {
+            try core.hasRole(core.DOCTOR_ROLE(), _doctor) returns (bool hasRole) {
+                validParty = validParty || hasRole;
+            } catch {
+                revert ExternalCallFailed();
+            }
+        }
+        if (_labTechnician != address(0)) {
+            try core.hasRole(core.LAB_TECH_ROLE(), _labTechnician) returns (bool hasRole) {
+                validParty = validParty || hasRole;
+            } catch {
+                revert ExternalCallFailed();
+            }
+        }
+        if (_pharmacy != address(0)) {
+            try core.hasRole(core.PHARMACY_ROLE(), _pharmacy) returns (bool hasRole) {
+                validParty = validParty || hasRole;
+            } catch {
+                revert ExternalCallFailed();
+            }
+        }
+        if (!validParty) revert InvalidParty();
 
+        // Updated: Fetch prescription with try-catch
+        TelemedicineMedicalCore.Prescription memory prescription;
+        try medical.prescriptions(_prescriptionId) returns (TelemedicineMedicalCore.Prescription memory p) {
+            prescription = p;
+        } catch {
+            revert ExternalCallFailed();
+        }
+        if (_prescriptionId == 0 || prescription.patient != msg.sender) revert InvalidPrescription();
+        if (prescription.patientCost < MIN_PATIENT_COST) revert InvalidPrescription();
+        if (block.timestamp > prescription.disputeWindowEnd) revert DisputeWindowExpired();
+        if (prescriptionToDisputeIds[_prescriptionId] != 0) revert InvalidPrescription();
+
+        if (disputeCounter >= MAX_DISPUTES) revert CounterOverflow();
         disputeCounter = disputeCounter.add(1);
         uint256 disputeId = disputeCounter;
 
@@ -174,60 +250,92 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
             resolutionReason: bytes32(0),
             escalated: false
         });
+        prescriptionToDisputeIds[_prescriptionId] = disputeId;
 
-        emit DisputeInitiated(disputeId, msg.sender, _doctor, _labTechnician, _pharmacy, _disputeType, _prescriptionId);
+        emit DisputeInitiated(disputeId, keccak256(abi.encode(msg.sender)), _disputeType, _prescriptionId);
     }
 
-    /// @notice Submits evidence for a dispute
-    /// @param _disputeId ID of the dispute
-    /// @param _evidenceHash IPFS hash of the submitted evidence
-    function submitEvidence(uint256 _disputeId, bytes32 _evidenceHash) external nonReentrant whenNotPaused {
-        Dispute storage dispute = disputes[_disputeId];
-        require(dispute.status == DisputeStatus.Pending, "Dispute not pending");
-        require(block.timestamp <= dispute.evidenceDeadline, "Evidence submission period expired");
-        require(_evidenceHash != bytes32(0), "Invalid evidence hash");
+    /// @notice Submits evidence for multiple disputes
+    /// @param _disputeIds Dispute IDs
+    /// @param _evidenceHashes IPFS evidence hashes
+    function batchSubmitEvidence(uint256[] calldata _disputeIds, bytes32[] calldata _evidenceHashes) 
+        external 
+        nonReentrant 
+        whenNotPaused 
+    {
+        if (_disputeIds.length != _evidenceHashes.length || _disputeIds.length > 100) revert InvalidInput();
+        for (uint256 i = 0; i < _disputeIds.length; i++) {
+            if (_evidenceHashes[i] == bytes32(0)) revert InvalidEvidenceHash();
+            Dispute storage dispute = disputes[_disputeIds[i]];
+            if (dispute.status != DisputeStatus.Pending) revert InvalidDisputeStatus();
+            if (block.timestamp > dispute.evidenceDeadline) revert EvidencePeriodExpired();
 
-        bool isValidParty = (msg.sender == dispute.patient && core.hasRole(core.PATIENT_ROLE(), msg.sender)) ||
-                           (msg.sender == dispute.doctor && core.hasRole(core.DOCTOR_ROLE(), msg.sender)) ||
-                           (msg.sender == dispute.labTechnician && core.hasRole(core.LAB_TECH_ROLE(), msg.sender)) ||
-                           (msg.sender == dispute.pharmacy && core.hasRole(core.PHARMACY_ROLE(), msg.sender));
-        require(isValidParty, "Unauthorized submitter");
+            bool isValidParty;
+            try core.hasRole(core.PATIENT_ROLE(), msg.sender) returns (bool isPatient) {
+                isValidParty = isValidParty || (isPatient && msg.sender == dispute.patient);
+            } catch {
+                revert ExternalCallFailed();
+            }
+            try core.hasRole(core.DOCTOR_ROLE(), msg.sender) returns (bool isDoctor) {
+                isValidParty = isValidParty || (isDoctor && msg.sender == dispute.doctor);
+            } catch {
+                revert ExternalCallFailed();
+            }
+            try core.hasRole(core.LAB_TECH_ROLE(), msg.sender) returns (bool isLabTech) {
+                isValidParty = isValidParty || (isLabTech && msg.sender == dispute.labTechnician);
+            } catch {
+                revert ExternalCallFailed();
+            }
+            try core.hasRole(core.PHARMACY_ROLE(), msg.sender) returns (bool isPharmacy) {
+                isValidParty = isValidParty || (isPharmacy && msg.sender == dispute.pharmacy);
+            } catch {
+                revert ExternalCallFailed();
+            }
+            if (!isValidParty) revert UnauthorizedSubmitter();
 
-        evidenceHashes[_disputeId][msg.sender] = _evidenceHash;
-        emit EvidenceSubmitted(_disputeId, msg.sender, _evidenceHash);
+            evidenceHashes[_disputeIds[i]][msg.sender] = _evidenceHashes[i];
+            emit EvidenceSubmitted(_disputeIds[i], keccak256(abi.encode(msg.sender)), _evidenceHashes[i]);
 
-        if (_allEvidenceSubmitted(_disputeId)) {
-            dispute.status = DisputeStatus.EvidenceSubmitted;
-            _requestOracleVerification(_disputeId);
+            if (_allEvidenceSubmitted(_disputeIds[i])) {
+                dispute.status = DisputeStatus.EvidenceSubmitted;
+                _requestOracleVerification(_disputeIds[i]);
+            }
         }
     }
 
-    /// @notice Requests Chainlink oracle verification for a dispute
-    /// @param _disputeId ID of the dispute to verify
+    /// @notice Requests Chainlink oracle verification
+    /// @param _disputeId Dispute ID
     function _requestOracleVerification(uint256 _disputeId) internal {
         Dispute storage dispute = disputes[_disputeId];
-        require(dispute.status == DisputeStatus.EvidenceSubmitted, "Not ready for oracle");
+        if (dispute.status != DisputeStatus.EvidenceSubmitted) revert InvalidDisputeStatus();
 
         if (linkToken.balanceOf(address(this)) < chainlinkFee) {
             dispute.status = DisputeStatus.Escalated;
             dispute.escalated = true;
             emit OracleRequestFailed(_disputeId, "Insufficient LINK");
-            emit DisputeEscalated(_disputeId, address(0));
+            emit DisputeEscalated(_disputeId, bytes32(0));
             return;
         }
 
         Chainlink.Request memory request = buildChainlinkRequest(chainlinkJobId, address(this), this.fulfillOracleResponse.selector);
-        request.add("disputeId", uint2str(_disputeId));
+        request.add("disputeId", _disputeId.toString());
         request.add("prescriptionHash", bytes32ToString(medical.prescriptions(dispute.prescriptionId).prescriptionIpfsHash));
         request.add("patientEvidenceHash", bytes32ToString(evidenceHashes[_disputeId][dispute.patient]));
         request.addString("endpoint", "verifyEvidence");
 
-        bytes32 requestId = sendChainlinkRequestTo(chainlinkOracle, request, chainlinkFee);
-        if (requestId == bytes32(0)) {
-            dispute.status = DisputeStatus.Escalated;
-            dispute.escalated = true;
-            emit OracleRequestFailed(_disputeId, "Chainlink request failed");
-            emit DisputeEscalated(_disputeId, address(0));
+        bytes32 requestId;
+        try this.sendChainlinkRequestTo(chainlinkOracle, request, chainlinkFee) returns (bytes32 id) {
+            requestId = id;
+        } catch {
+            chainlinkRetryCounts[_disputeId] = chainlinkRetryCounts[_disputeId].add(1);
+            if (chainlinkRetryCounts[_disputeId] >= MAX_RETRIES) {
+                dispute.status = DisputeStatus.Escalated;
+                dispute.escalated = true;
+                emit OracleRequestFailed(_disputeId, "Max retries exceeded");
+                emit DisputeEscalated(_disputeId, bytes32(0));
+                return;
+            }
+            _requestOracleVerification(_disputeId); // Retry
             return;
         }
 
@@ -236,56 +344,73 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
         emit OracleRequestSent(_disputeId, requestId);
     }
 
-    /// @notice Handles Chainlink oracle response for dispute verification
+    /// @notice Handles Chainlink oracle response
     /// @param _requestId Chainlink request ID
-    /// @param _isMismatch Whether evidence indicates a mismatch
-    /// @param _evidenceResultHash Hash of the oracle's evidence result
-    function fulfillOracleResponse(bytes32 _requestId, bool _isMismatch, bytes32 _evidenceResultHash) external recordChainlinkFulfillment(_requestId) {
+    /// @param _isMismatch Evidence mismatch flag
+    /// @param _evidenceResultHash Result hash
+    function fulfillOracleResponse(bytes32 _requestId, bool _isMismatch, bytes32 _evidenceResultHash) 
+        external 
+        recordChainlinkFulfillment(_requestId) 
+    {
         uint256 disputeId = chainlinkRequestToDisputeId[_requestId];
         Dispute storage dispute = disputes[disputeId];
-        require(dispute.status == DisputeStatus.OracleRequested, "Invalid dispute state");
-        require(block.timestamp <= dispute.createdAt.add(oracleTimeout), "Oracle timeout exceeded");
+        if (dispute.status != DisputeStatus.OracleRequested) revert InvalidDisputeStatus();
+        if (block.timestamp > dispute.evidenceDeadline.add(oracleTimeout)) revert OracleTimeout();
 
         if (_isMismatch && dispute.disputeType == DisputeType.PharmacyError) {
             _autoResolveDispute(disputeId, _evidenceResultHash);
         } else {
             dispute.status = DisputeStatus.Escalated;
             dispute.escalated = true;
-            emit DisputeEscalated(disputeId, address(0));
+            emit DisputeEscalated(disputeId, bytes32(0));
         }
     }
 
-    /// @notice Queues resolution of an escalated dispute with timelock
-    /// @param _disputeId ID of the dispute to resolve
-    /// @param _patientWins Whether the patient wins the dispute
-    /// @param _resolutionReason Reason for the resolution
-    function queueResolveDispute(uint256 _disputeId, bool _patientWins, bytes32 _resolutionReason) external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused {
+    /// @notice Queues dispute resolution
+    /// @param _disputeId Dispute ID
+    /// @param _patientWins Patient win flag
+    /// @param _resolutionReason Resolution reason hash
+    function queueResolveDispute(uint256 _disputeId, bool _patientWins, bytes32 _resolutionReason) 
+        external 
+        onlyGovernanceApprover 
+        nonReentrant 
+        whenNotPaused 
+    {
         Dispute storage dispute = disputes[_disputeId];
-        require(dispute.status == DisputeStatus.Escalated, "Dispute not escalated");
-        require(_resolutionReason != bytes32(0), "Invalid resolution reason");
+        if (dispute.status != DisputeStatus.Escalated) revert InvalidDisputeStatus();
+        if (_resolutionReason == bytes32(0)) revert InvalidResolutionReason();
 
         bytes memory data = abi.encodeWithSignature("executeResolveDispute(uint256,bool,bytes32)", _disputeId, _patientWins, _resolutionReason);
-        governance._queueTimeLock(
-            TelemedicineGovernanceCore.TimeLockAction(6), // Assuming 6 is DisputeResolution action
+        try governance._queueTimeLock(
+            TelemedicineGovernanceCore.TimeLockAction.DisputeResolution, // Updated: Dynamic enum
             address(this),
             0,
             data
-        );
+        ) {} catch {
+            revert ExternalCallFailed();
+        }
     }
 
-    /// @notice Executes resolution of an escalated dispute after timelock
-    /// @param _disputeId ID of the dispute to resolve
-    /// @param _patientWins Whether the patient wins the dispute
-    /// @param _resolutionReason Reason for the resolution
-    function executeResolveDispute(uint256 _disputeId, bool _patientWins, bytes32 _resolutionReason) external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused {
+    /// @notice Executes dispute resolution
+    /// @param _disputeId Dispute ID
+    /// @param _patientWins Patient win flag
+    /// @param _resolutionReason Resolution reason hash
+    function executeResolveDispute(uint256 _disputeId, bool _patientWins, bytes32 _resolutionReason) 
+        external 
+        onlyGovernanceApprover 
+        nonReentrant 
+        whenNotPaused 
+    {
         Dispute storage dispute = disputes[_disputeId];
-        require(dispute.status == DisputeStatus.Escalated, "Dispute not escalated");
+        if (dispute.status != DisputeStatus.Escalated) revert InvalidDisputeStatus();
 
         dispute.status = DisputeStatus.Resolved;
         dispute.resolutionReason = _resolutionReason;
 
         if (_patientWins) {
-            payments.refundPatient(dispute.patient, dispute.patientCost, dispute.paymentType, dispute.id);
+            try payments.refundPatient(dispute.patient, dispute.patientCost, dispute.paymentType, dispute.id) {} catch {
+                revert ExternalCallFailed();
+            }
             if (dispute.disputeType == DisputeType.PharmacyError) {
                 _orderReplacement(dispute);
             }
@@ -294,60 +419,59 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
         emit DisputeResolved(_disputeId, _resolutionReason);
     }
 
-    /// @notice Cancels a dispute by the patient or admin
-    /// @param _disputeId ID of the dispute to cancel
+    /// @notice Cancels a dispute
+    /// @param _disputeId Dispute ID
     function cancelDispute(uint256 _disputeId) external nonReentrant whenNotPaused {
         Dispute storage dispute = disputes[_disputeId];
-        require(dispute.status == DisputeStatus.Pending || dispute.status == DisputeStatus.EvidenceSubmitted, "Cannot cancel dispute");
-        require(msg.sender == dispute.patient || core.hasRole(core.ADMIN_ROLE(), msg.sender), "Unauthorized canceller");
+        if (dispute.status != DisputeStatus.Pending && dispute.status != DisputeStatus.EvidenceSubmitted) revert InvalidDisputeStatus();
+
+        bool isAuthorized;
+        try core.hasRole(core.ADMIN_ROLE(), msg.sender) returns (bool isAdmin) {
+            isAuthorized = isAdmin || msg.sender == dispute.patient;
+        } catch {
+            revert ExternalCallFailed();
+        }
+        if (!isAuthorized) revert NotAuthorized();
 
         dispute.status = DisputeStatus.Cancelled;
-        emit DisputeCancelled(_disputeId, msg.sender);
+        emit DisputeCancelled(_disputeId, keccak256(abi.encode(msg.sender)));
     }
 
-    /// @notice Checks if an ID is disputed
-    /// @param _id ID of the prescription or other entity to check
-    /// @return True if the ID is associated with an active dispute
+    /// @notice Checks if a prescription is disputed
+    /// @param _id Prescription ID
+    /// @return True if disputed
     function isDisputed(uint256 _id) external view returns (bool) {
-        for (uint256 i = 1; i <= disputeCounter; i++) {
-            Dispute storage dispute = disputes[i];
-            if (dispute.prescriptionId == _id && 
-                (dispute.status == DisputeStatus.Pending || 
-                 dispute.status == DisputeStatus.EvidenceSubmitted || 
-                 dispute.status == DisputeStatus.OracleRequested || 
-                 dispute.status == DisputeStatus.Escalated)) {
-                return true;
-            }
-        }
-        return false;
+        uint256 disputeId = prescriptionToDisputeIds[_id];
+        if (disputeId == 0) return false;
+        Dispute storage dispute = disputes[disputeId];
+        return dispute.status == DisputeStatus.Pending ||
+               dispute.status == DisputeStatus.EvidenceSubmitted ||
+               dispute.status == DisputeStatus.OracleRequested ||
+               dispute.status == DisputeStatus.Escalated;
     }
 
-    /// @notice Gets the outcome of a resolved dispute
-    /// @param _id ID of the prescription or other entity
-    /// @return DisputeOutcome enum value (Unresolved, PatientFavored, ProviderFavored, MutualAgreement)
+    /// @notice Gets dispute outcome
+    /// @param _id Prescription ID
+    /// @return Dispute outcome
     function getDisputeOutcome(uint256 _id) external view returns (TelemedicineMedicalCore.DisputeOutcome) {
-        for (uint256 i = 1; i <= disputeCounter; i++) {
-            Dispute storage dispute = disputes[i];
-            if (dispute.prescriptionId == _id) {
-                if (dispute.status == DisputeStatus.Resolved || dispute.status == DisputeStatus.AutoResolved) {
-                    if (dispute.resolutionReason != bytes32(0)) {
-                        return TelemedicineMedicalCore.DisputeOutcome.PatientFavored;
-                    }
-                    return TelemedicineMedicalCore.DisputeOutcome.ProviderFavored;
-                } else if (dispute.status == DisputeStatus.Cancelled) {
-                    return TelemedicineMedicalCore.DisputeOutcome.MutualAgreement;
-                }
-                return TelemedicineMedicalCore.DisputeOutcome.Unresolved;
-            }
+        uint256 disputeId = prescriptionToDisputeIds[_id];
+        if (disputeId == 0) return TelemedicineMedicalCore.DisputeOutcome.Unresolved;
+        Dispute storage dispute = disputes[disputeId];
+        if (dispute.status == DisputeStatus.Resolved || dispute.status == DisputeStatus.AutoResolved) {
+            return dispute.resolutionReason != bytes32(0) ? 
+                   TelemedicineMedicalCore.DisputeOutcome.PatientFavored : 
+                   TelemedicineMedicalCore.DisputeOutcome.ProviderFavored;
+        } else if (dispute.status == DisputeStatus.Cancelled) {
+            return TelemedicineMedicalCore.DisputeOutcome.MutualAgreement;
         }
         return TelemedicineMedicalCore.DisputeOutcome.Unresolved;
     }
 
     // Internal Functions
 
-    /// @notice Checks if all required evidence has been submitted for a dispute
-    /// @param _disputeId ID of the dispute
-    /// @return True if all parties have submitted evidence
+    /// @notice Checks if all evidence is submitted
+    /// @param _disputeId Dispute ID
+    /// @return True if complete
     function _allEvidenceSubmitted(uint256 _disputeId) internal view returns (bool) {
         Dispute storage dispute = disputes[_disputeId];
         return (dispute.patient != address(0) && evidenceHashes[_disputeId][dispute.patient] != bytes32(0)) &&
@@ -356,15 +480,17 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
                (dispute.pharmacy == address(0) || evidenceHashes[_disputeId][dispute.pharmacy] != bytes32(0));
     }
 
-    /// @notice Automatically resolves a dispute based on oracle response
-    /// @param _disputeId ID of the dispute to resolve
-    /// @param _resolutionReason Reason for the resolution
+    /// @notice Auto-resolves a dispute
+    /// @param _disputeId Dispute ID
+    /// @param _resolutionReason Resolution reason hash
     function _autoResolveDispute(uint256 _disputeId, bytes32 _resolutionReason) internal {
         Dispute storage dispute = disputes[_disputeId];
         dispute.status = DisputeStatus.AutoResolved;
         dispute.resolutionReason = _resolutionReason;
 
-        payments.refundPatient(dispute.patient, dispute.patientCost, dispute.paymentType, dispute.id);
+        try payments.refundPatient(dispute.patient, dispute.patientCost, dispute.paymentType, dispute.id) {} catch {
+            revert ExternalCallFailed();
+        }
         if (dispute.disputeType == DisputeType.PharmacyError) {
             _orderReplacement(dispute);
         }
@@ -372,8 +498,8 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
         emit DisputeAutoResolved(_disputeId, _resolutionReason);
     }
 
-    /// @notice Orders a replacement prescription for a pharmacy error
-    /// @param _dispute Dispute struct containing details
+    /// @notice Orders a replacement prescription
+    /// @param _dispute Dispute struct
     function _orderReplacement(Dispute storage _dispute) internal {
         bytes32 operationHash = keccak256(abi.encodePacked(
             "orderReplacementPrescription",
@@ -381,115 +507,213 @@ contract TelemedicineDisputeResolution is Initializable, UUPSUpgradeable, Reentr
             address(this),
             block.timestamp
         ));
-        medical.orderReplacementPrescription(_dispute.prescriptionId, operationHash);
-        // Note: Multi-sig approval must be handled externally in TelemedicineMedicalCore
-    }
-
-    // Admin Configuration Functions with Timelock
-
-    /// @notice Queues an update to the Chainlink oracle address
-    /// @param _newOracle New Chainlink oracle address
-    function queueUpdateChainlinkOracle(address _newOracle) external onlyRole(core.ADMIN_ROLE()) {
-        require(_newOracle != address(0), "Invalid oracle address");
-        bytes memory data = abi.encodeWithSignature("executeUpdateChainlinkOracle(address)", _newOracle);
-        governance._queueTimeLock(TelemedicineGovernanceCore.TimeLockAction(5), address(this), 0, data);
-    }
-
-    /// @notice Executes an update to the Chainlink oracle address
-    /// @param _newOracle New Chainlink oracle address
-    function executeUpdateChainlinkOracle(address _newOracle) external onlyRole(core.ADMIN_ROLE()) {
-        chainlinkOracle = _newOracle;
-    }
-
-    /// @notice Queues an update to the dispute submission period
-    /// @param _newPeriod New dispute submission period in seconds
-    function queueUpdateDisputeSubmissionPeriod(uint256 _newPeriod) external onlyRole(core.ADMIN_ROLE()) {
-        require(_newPeriod >= 1 days, "Period too short");
-        bytes memory data = abi.encodeWithSignature("executeUpdateDisputeSubmissionPeriod(uint256)", _newPeriod);
-        governance._queueTimeLock(TelemedicineGovernanceCore.TimeLockAction(5), address(this), 0, data);
-    }
-
-    /// @notice Executes an update to the dispute submission period
-    /// @param _newPeriod New dispute submission period in seconds
-    function executeUpdateDisputeSubmissionPeriod(uint256 _newPeriod) external onlyRole(core.ADMIN_ROLE()) {
-        disputeSubmissionPeriod = _newPeriod;
-    }
-
-    /// @notice Queues an update to the evidence submission period
-    /// @param _newPeriod New evidence submission period in seconds
-    function queueUpdateEvidenceSubmissionPeriod(uint256 _newPeriod) external onlyRole(core.ADMIN_ROLE()) {
-        require(_newPeriod >= 12 hours, "Period too short");
-        bytes memory data = abi.encodeWithSignature("executeUpdateEvidenceSubmissionPeriod(uint256)", _newPeriod);
-        governance._queueTimeLock(TelemedicineGovernanceCore.TimeLockAction(5), address(this), 0, data);
-    }
-
-    /// @notice Executes an update to the evidence submission period
-    /// @param _newPeriod New evidence submission period in seconds
-    function executeUpdateEvidenceSubmissionPeriod(uint256 _newPeriod) external onlyRole(core.ADMIN_ROLE()) {
-        evidenceSubmissionPeriod = _newPeriod;
-    }
-
-    /// @notice Queues an update to the oracle timeout period
-    /// @param _newTimeout New oracle timeout period in seconds
-    function queueUpdateOracleTimeout(uint256 _newTimeout) external onlyRole(core.ADMIN_ROLE()) {
-        require(_newTimeout >= 6 hours, "Timeout too short");
-        bytes memory data = abi.encodeWithSignature("executeUpdateOracleTimeout(uint256)", _newTimeout);
-        governance._queueTimeLock(TelemedicineGovernanceCore.TimeLockAction(5), address(this), 0, data);
-    }
-
-    /// @notice Executes an update to the oracle timeout period
-    /// @param _newTimeout New oracle timeout period in seconds
-    function executeUpdateOracleTimeout(uint256 _newTimeout) external onlyRole(core.ADMIN_ROLE()) {
-        oracleTimeout = _newTimeout;
-    }
-
-    // Utility Functions for Chainlink
-
-    /// @notice Converts a uint256 to a string
-    /// @param _i The uint256 value to convert
-    /// @return The string representation of the uint256
-    function uint2str(uint256 _i) internal pure returns (string memory) {
-        if (_i == 0) return "0";
-        uint256 j = _i;
-        uint256 length;
-        while (j != 0) {
-            length++;
-            j /= 10;
+        try medical.orderReplacementPrescription(_dispute.prescriptionId, operationHash) {} catch {
+            revert ExternalCallFailed();
         }
-        bytes memory bstr = new bytes(length);
-        uint256 k = length;
-        while (_i != 0) {
-            k = k - 1;
-            uint8 temp = uint8(48 + (_i % 10));
-            bstr[k] = bytes1(temp);
-            _i /= 10;
-        }
-        return string(bstr);
+        emit ReplacementOrdered(_dispute.id, _dispute.prescriptionId);
     }
 
-    /// @notice Converts a bytes32 to a string
-    /// @param _bytes32 The bytes32 value to convert
-    /// @return The string representation of the bytes32
+    /// @notice Converts bytes32 to string
+    /// @param _bytes32 Bytes32 value
+    /// @return String representation
     function bytes32ToString(bytes32 _bytes32) internal pure returns (string memory) {
-        bytes memory bytesArray = new bytes(32);
+        bytes memory chars = "0123456789abcdef";
+        bytes memory result = new bytes(64);
         for (uint256 i = 0; i < 32; i++) {
-            bytesArray[i] = _bytes32[i];
+            result[i*2] = chars[uint8(_bytes32[i] >> 4)];
+            result[i*2+1] = chars[uint8(_bytes32[i] & 0x0f)];
         }
-        return string(bytesArray);
+        return string(result);
+    }
+
+    // Admin Configuration Functions
+
+    /// @notice Updates configuration parameters
+    /// @param _parameter Parameter name
+    /// @param _value New value
+    function updateConfiguration(string memory _parameter, uint256 _value) external onlyConfigAdmin {
+        bytes32 paramHash = keccak256(abi.encodePacked(_parameter));
+        bytes memory data;
+
+        if (paramHash == keccak256(abi.encodePacked("disputeSubmissionPeriod"))) {
+            if (_value < 1 days) revert InvalidConfiguration();
+            data = abi.encodeWithSignature("executeUpdateDisputeSubmissionPeriod(uint256)", _value);
+        } else if (paramHash == keccak256(abi.encodePacked("evidenceSubmissionPeriod"))) {
+            if (_value < 12 hours) revert InvalidConfiguration();
+            data = abi.encodeWithSignature("executeUpdateEvidenceSubmissionPeriod(uint256)", _value);
+        } else if (paramHash == keccak256(abi.encodePacked("oracleTimeout"))) {
+            if (_value < 6 hours) revert InvalidConfiguration();
+            data = abi.encodeWithSignature("executeUpdateOracleTimeout(uint256)", _value);
+        } else if (paramHash == keccak256(abi.encodePacked("chainlinkFee"))) {
+            if (_value < MIN_CHAINLINK_FEE) revert InvalidConfiguration();
+            data = abi.encodeWithSignature("executeUpdateChainlinkFee(uint256)", _value);
+        } else {
+            revert InvalidConfiguration();
+        }
+
+        try governance._queueTimeLock(
+            TelemedicineGovernanceCore.TimeLockAction.ConfigurationUpdate,
+            address(this),
+            0,
+            data
+        ) {} catch {
+            revert ExternalCallFailed();
+        }
+    }
+
+    /// @notice Updates Chainlink configuration
+    /// @param _parameter Parameter name
+    /// @param _value New address
+    function updateChainlinkConfiguration(string memory _parameter, address _value) external onlyConfigAdmin {
+        if (_value == address(0) || !_isContract(_value)) revert InvalidAddress();
+        bytes memory data;
+
+        bytes32 paramHash = keccak256(abi.encodePacked(_parameter));
+        if (paramHash == keccak256(abi.encodePacked("chainlinkOracle"))) {
+            data = abi.encodeWithSignature("executeUpdateChainlinkOracle(address)", _value);
+        } else if (paramHash == keccak256(abi.encodePacked("linkToken"))) {
+            data = abi.encodeWithSignature("executeUpdateLinkToken(address)", _value);
+        } else {
+            revert InvalidConfiguration();
+        }
+
+        try governance._queueTimeLock(
+            TelemedicineGovernanceCore.TimeLockAction.ConfigurationUpdate,
+            address(this),
+            0,
+            data
+        ) {} catch {
+            revert ExternalCallFailed();
+        }
+    }
+
+    /// @notice Executes Chainlink oracle update
+    /// @param _newOracle New oracle address
+    function executeUpdateChainlinkOracle(address _newOracle) external onlyConfigAdmin {
+        chainlinkOracle = _newOracle;
+        emit ChainlinkConfigUpdated("chainlinkOracle", _newOracle);
+    }
+
+    /// @notice Executes LINK token update
+    /// @param _newToken New LINK token address
+    function executeUpdateLinkToken(address _newToken) external onlyConfigAdmin {
+        linkToken = LinkTokenInterface(_newToken);
+        setChainlinkToken(_newToken);
+        emit ChainlinkConfigUpdated("linkToken", _newToken);
+    }
+
+    /// @notice Executes dispute submission period update
+    /// @param _newPeriod New period
+    function executeUpdateDisputeSubmissionPeriod(uint256 _newPeriod) external onlyConfigAdmin {
+        disputeSubmissionPeriod = _newPeriod;
+        emit ConfigurationUpdated("disputeSubmissionPeriod", _newPeriod);
+    }
+
+    /// @notice Executes evidence submission period update
+    /// @param _newPeriod New period
+    function executeUpdateEvidenceSubmissionPeriod(uint256 _newPeriod) external onlyConfigAdmin {
+        evidenceSubmissionPeriod = _newPeriod;
+        emit ConfigurationUpdated("evidenceSubmissionPeriod", _newPeriod);
+    }
+
+    /// @notice Executes oracle timeout update
+    /// @param _newTimeout New timeout
+    function executeUpdateOracleTimeout(uint256 _newTimeout) external onlyConfigAdmin {
+        oracleTimeout = _newTimeout;
+        emit ConfigurationUpdated("oracleTimeout", _newTimeout);
+    }
+
+    /// @notice Executes Chainlink fee update
+    /// @param _newFee New fee
+    function executeUpdateChainlinkFee(uint256 _newFee) external onlyConfigAdmin {
+        chainlinkFee = _newFee;
+        emit ConfigurationUpdated("chainlinkFee", _newFee);
+    }
+
+    // View Functions
+
+    /// @notice Gets dispute details
+    /// @param _disputeId Dispute ID
+    /// @return Dispute struct
+    function getDispute(uint256 _disputeId) external view onlyRole(core.ADMIN_ROLE()) returns (Dispute memory) {
+        return disputes[_disputeId];
+    }
+
+    /// @notice Gets evidence hash
+    /// @param _disputeId Dispute ID
+    /// @param _party Party address
+    /// @return Evidence hash
+    function getEvidenceHash(uint256 _disputeId, address _party) external view onlyRole(core.ADMIN_ROLE()) returns (bytes32) {
+        return evidenceHashes[_disputeId][_party];
+    }
+
+    /// @notice Gets Chainlink request dispute ID
+    /// @param _requestId Request ID
+    /// @return Dispute ID
+    function getChainlinkRequestDisputeId(bytes32 _requestId) external view onlyRole(core.ADMIN_ROLE()) returns (uint256) {
+        return chainlinkRequestToDisputeId[_requestId];
+    }
+
+    // Utility Functions
+
+    /// @notice Checks if an address is a contract
+    /// @param addr Address to check
+    /// @return True if contract
+    function _isContract(address addr) internal view returns (bool) {
+        uint256 size;
+        assembly { size := extcodesize(addr) }
+        return size > 0;
     }
 
     // Modifiers
 
-    /// @notice Restricts access to a specific role
-    /// @param role The role required to call the function
     modifier onlyRole(bytes32 role) {
-        require(core.hasRole(role, msg.sender), "Unauthorized");
-        _;
+        try core.hasRole(role, msg.sender) returns (bool hasRole) {
+            if (!hasRole) revert NotAuthorized();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
 
-    /// @notice Ensures the contract is not paused
-    modifier whenNotPaused() {
-        require(!core.paused(), "Pausable: paused");
-        _;
+    modifier onlyConfigAdmin() {
+        try core.isConfigAdmin(msg.sender) returns (bool isAdmin) {
+            if (!isAdmin) revert NotAuthorized();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
+
+    modifier onlyGovernanceApprover() {
+        try core.isGovernanceApprover(msg.sender) returns (bool isApprover) {
+            if (!isApprover) revert NotAuthorized();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
+    }
+
+    modifier whenNotPaused() {
+        try core.paused() returns (bool corePaused) {
+            if (corePaused != paused()) {
+                corePaused ? _pause() : _unpause();
+            }
+            if (paused()) revert ContractPaused();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
+    }
+
+    // Errors for new functionality
+    error NotAuthorized();
+    error ContractPaused();
+    error InvalidInput();
+
+    // Fallback
+    receive() external payable {}
+
+    // New: Storage gap
+    uint256[50] private __gap;
 }
