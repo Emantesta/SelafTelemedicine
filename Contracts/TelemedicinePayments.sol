@@ -12,7 +12,11 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/Ag
 import {TelemedicineCore} from "./TelemedicineCore.sol";
 import {TelemedicineDisputeResolution} from "./TelemedicineDisputeResolution.sol";
 import {TelemedicineOperations} from "./TelemedicineOperations.sol";
+import {ITelemedicinePayments} from "./Interfaces/ITelemedicinePayments.sol";
 
+/// @title TelemedicinePayments
+/// @notice Handles on-ramp, off-ramp, payment queuing, and patient refunds
+/// @dev UUPS upgradeable, integrates with TelemedicineCore, TelemedicineDisputeResolution, and TelemedicineOperations
 contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
     using SafeMathUpgradeable for uint256;
     using SafeERC20Upgradeable for IERC20Upgradeable;
@@ -23,13 +27,28 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     error InvalidAddress();
     error InsufficientFunds();
     error PaymentFailed();
-    error InvalidStatus();
+    error InvalidRequestStatus();
     error StalePriceFeed();
     error OracleFailure();
+    error ExternalCallFailed();
+    error InvalidSignature();
+    error InsufficientReserve();
+    error InvalidFee();
+    error CounterOverflow();
 
-    TelemedicineCore public core;
-    TelemedicineDisputeResolution public disputeResolution;
-    TelemedicineOperations public operations;
+    // Constants
+    uint256 public constant MIN_FEE_USD = 0.1 * 10**18; // New: 0.1 USD minimum (18 decimals)
+    uint48 public constant MAX_STALENESS = 1 hours;
+    uint48 public constant PENDING_PAYMENT_TIMEOUT = 7 days;
+    uint256 public constant DEFAULT_FIAT_PRICE = 10**8; // 1 USD in 8 decimals (fallback)
+    uint256 public constant ETH_TRANSFER_GAS_LIMIT = 30000; // New: Fixed 30,000 gas
+    uint256 public constant MAX_PENDING_PAYMENTS = 1_000_000; // New: Limit pending payments
+    uint256 public constant MAX_ITERATIONS = 100; // New: Limit loop iterations
+
+    // State Variables
+    TelemedicineCore public immutable core;
+    TelemedicineDisputeResolution public immutable disputeResolution;
+    TelemedicineOperations public immutable operations;
     IERC20Upgradeable public usdcToken;
     IERC20Upgradeable public sonicToken;
     AggregatorV3Interface public ethUsdPriceFeed;
@@ -37,28 +56,29 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     AggregatorV3Interface public usdFiatOracle;
     address public onRampProvider;
     address public offRampProvider;
-    address public multiSigWallet; // Added for decentralized upgrade authorization
+    address public multiSigWallet;
     address[] public trustedOracles;
-
-    uint256 public onRampFee; // Fee in USD (scaled to 18 decimals)
-    uint256 public offRampFee; // Fee in USD (scaled to 18 decimals)
+    uint256 public onRampFee; // USD (18 decimals)
+    uint256 public offRampFee; // USD (18 decimals)
     uint256 public onRampCounter;
     uint256 public offRampCounter;
+    uint256 public pendingPaymentCounter;
+    uint256 public versionNumber; // New: Track contract version
+    uint256 public maxFeeCapUsd; // New: Configurable max fee (USDC decimals)
 
+    // Mappings
     mapping(uint256 => OnRampRequest) public onRampRequests;
     mapping(uint256 => OffRampRequest) public offRampRequests;
+    mapping(uint256 => PendingPayment) public pendingPayments;
 
+    // Structs
     struct PendingPayment {
         address recipient;
         uint256 amount;
-        PaymentType paymentType;
+        ITelemedicinePayments.PaymentType paymentType;
         bool processed;
-        uint48 requestTimestamp;
     }
-    mapping(uint256 => PendingPayment) public pendingPayments;
-    uint256 public pendingPaymentCounter;
 
-    enum PaymentType { ETH, USDC, SONIC }
     enum OnRampStatus { Pending, Fulfilled, Failed }
     enum OffRampStatus { Pending, Locked, Fulfilled, Failed }
 
@@ -66,66 +86,60 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         uint256 id;
         address user;
         uint256 fiatAmount;
-        PaymentType targetToken;
+        ITelemedicinePayments.PaymentType targetToken;
         OnRampStatus status;
         uint256 cryptoAmount;
         uint48 requestTimestamp;
-        string providerReference;
-        uint256 feePaid; // Added to track fee for refunds
+        bytes32 providerReference; // Updated: Hashed reference
+        uint256 feePaid;
     }
 
     struct OffRampRequest {
         uint256 id;
         address user;
-        PaymentType sourceToken;
+        ITelemedicinePayments.PaymentType sourceToken;
         uint256 cryptoAmount;
         uint256 fiatAmount;
         OffRampStatus status;
         uint48 requestTimestamp;
-        string bankDetails;
+        bytes32 bankDetails; // Updated: Hashed details
     }
 
-    // Constants
-    uint256 public constant MAX_FEE_CAP_USD = 10 * 10**18; // 10 USD max fee (18 decimals)
-    uint48 public constant MAX_STALENESS = 1 hours;
-    uint48 public constant PENDING_PAYMENT_TIMEOUT = 7 days;
-    uint256 public constant DEFAULT_FIAT_PRICE = 10**8; // 1 USD in 8 decimals (fallback)
-
-    event OnRampRequested(uint256 indexed requestId, address indexed user, uint256 fiatAmount, PaymentType targetToken, string providerReference);
+    // Events
+    event OnRampRequested(uint256 indexed requestId, address indexed user, uint256 fiatAmount, ITelemedicinePayments.PaymentType targetToken, bytes32 providerReference);
     event OnRampFulfilled(uint256 indexed requestId, address indexed user, uint256 cryptoAmount);
     event OnRampFailed(uint256 indexed requestId, address indexed user, string reason);
-    event OffRampRequested(uint256 indexed requestId, address indexed user, PaymentType sourceToken, uint256 cryptoAmount, string bankDetails);
+    event OffRampRequested(uint256 indexed requestId, address indexed user, ITelemedicinePayments.PaymentType sourceToken, uint256 cryptoAmount, bytes32 bankDetails);
     event OffRampLocked(uint256 indexed requestId, address indexed user, uint256 cryptoAmount);
     event OffRampFulfilled(uint256 indexed requestId, address indexed user, uint256 fiatAmount);
     event OffRampFailed(uint256 indexed requestId, address indexed user, string reason);
-    event OnRampProviderUpdated(address indexed oldProvider, address indexed newProvider);
-    event OffRampProviderUpdated(address indexed oldProvider, address indexed newProvider);
+    event ProviderUpdated(string indexed providerType, address indexed oldProvider, address indexed newProvider); // Updated: Consistent naming
     event RampFeeUpdated(string indexed rampType, uint256 oldFee, uint256 newFee);
     event PriceFeedUpdated(string indexed feedType, address indexed oldFeed, address indexed newFeed);
-    event PatientRefunded(uint256 indexed disputeId, address indexed patient, uint256 amount, PaymentType paymentType);
-    event PaymentQueued(uint256 indexed paymentId, address recipient, uint256 amount, PaymentType paymentType);
+    event PatientRefunded(uint256 indexed disputeId, address indexed patient, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
+    event PaymentQueued(uint256 indexed paymentId, address recipient, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
     event PaymentReleasedFromQueue(uint256 indexed paymentId, address recipient, uint256 amount);
     event PendingPaymentCleaned(uint256 indexed paymentId, address recipient, uint256 amount);
-    event ReserveFundAllocated(uint256 indexed operationId, uint256 amount, PaymentType paymentType);
-    event PlatformFeeAllocated(uint256 indexed operationId, uint256 amount, PaymentType paymentType);
+    event ReserveFundAllocated(uint256 indexed operationId, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
+    event PlatformFeeAllocated(uint256 indexed operationId, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
-    /// @notice Initializes the contract with external dependencies and default settings
-    /// @param _core Address of the TelemedicineCore contract
-    /// @param _usdcToken Address of the USDC token contract
-    /// @param _sonicToken Address of the SONIC token contract
-    /// @param _ethUsdPriceFeed Address of the ETH/USD Chainlink price feed
-    /// @param _sonicUsdPriceFeed Address of the SONIC/USD Chainlink price feed
-    /// @param _usdFiatOracle Address of the USD/Fiat oracle
-    /// @param _onRampProvider Address of the on-ramp provider
-    /// @param _offRampProvider Address of the off-ramp provider
-    /// @param _disputeResolution Address of the dispute resolution contract
-    /// @param _operations Address of the operations contract
-    /// @param _multiSigWallet Address of the multi-signature wallet for upgrades
+    /// @notice Initializes the contract
+    /// @param _core TelemedicineCore address
+    /// @param _usdcToken USDC token address
+    /// @param _sonicToken SONIC token address
+    /// @param _ethUsdPriceFeed ETH/USD price feed address
+    /// @param _sonicUsdPriceFeed SONIC/USD price feed address
+    /// @param _usdFiatOracle USD/Fiat oracle address
+    /// @param _onRampProvider On-ramp provider address
+    /// @param _offRampProvider Off-ramp provider address
+    /// @param _disputeResolution Dispute resolution address
+    /// @param _operations Operations address
+    /// @param _multiSigWallet Multi-signature wallet address
     function initialize(
         address _core,
         address _usdcToken,
@@ -143,6 +157,8 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
             _ethUsdPriceFeed == address(0) || _sonicUsdPriceFeed == address(0) || _usdFiatOracle == address(0) ||
             _onRampProvider == address(0) || _offRampProvider == address(0) || _disputeResolution == address(0) ||
             _operations == address(0) || _multiSigWallet == address(0)) revert InvalidAddress();
+        // Updated: Validate multiSigWallet
+        if (!_isContract(_multiSigWallet)) revert InvalidAddress();
 
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
@@ -164,47 +180,54 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         trustedOracles.push(_usdFiatOracle);
         onRampFee = 1 * 10**18; // 1 USD (18 decimals)
         offRampFee = 2 * 10**18; // 2 USD (18 decimals)
-        onRampCounter = 0;
-        offRampCounter = 0;
-        pendingPaymentCounter = 0;
+        maxFeeCapUsd = 10 * 10**6; // New: 10 USDC (6 decimals)
+        versionNumber = 1;
     }
 
-    /// @notice Authorizes an upgrade to a new implementation
-    /// @param newImplementation Address of the new contract implementation
+    /// @notice Returns the contract version
+    /// @return Version number
+    function version() external view returns (uint256) {
+        return versionNumber;
+    }
+
+    /// @notice Authorizes an upgrade
+    /// @param newImplementation New implementation address
     function _authorizeUpgrade(address newImplementation) internal override {
+        // Updated: Restrict to multiSigWallet and increment version
         if (msg.sender != multiSigWallet) revert NotAuthorized();
+        if (!_isContract(newImplementation)) revert InvalidAddress();
+        versionNumber++;
     }
 
-    /// @notice Queues a payment when funds are insufficient
-    /// @param _recipient Address to receive the payment
+    /// @notice Queues a payment
+    /// @param _recipient Recipient address
     /// @param _amount Amount to pay
-    /// @param _paymentType Type of payment (ETH, USDC, SONIC)
-    /// @param _timestamp Timestamp of the request
-    function queuePayment(address _recipient, uint256 _amount, PaymentType _paymentType, uint48 _timestamp) 
+    /// @param _paymentType Payment type (ETH, USDC, SONIC)
+    function queuePayment(address _recipient, uint256 _amount, ITelemedicinePayments.PaymentType _paymentType) 
         external 
         nonReentrant 
         whenNotPaused 
     {
-        if (msg.sender != address(operations) && !core.hasRole(core.ADMIN_ROLE(), msg.sender)) revert NotAuthorized();
+        // Updated: Try-catch for role check
+        try core.hasRole(core.ADMIN_ROLE(), msg.sender) returns (bool isAdmin) {
+            if (msg.sender != address(operations) && !isAdmin) revert NotAuthorized();
+        } catch {
+            revert ExternalCallFailed();
+        }
         if (_recipient == address(0)) revert InvalidAddress();
         if (_amount == 0) revert InsufficientFunds();
-        
+        if (pendingPaymentCounter >= MAX_PENDING_PAYMENTS) revert CounterOverflow();
+
         pendingPaymentCounter = pendingPaymentCounter.add(1);
-        pendingPayments[pendingPaymentCounter] = PendingPayment(
-            _recipient,
-            _amount,
-            _paymentType,
-            false,
-            _timestamp
-        );
+        pendingPayments[pendingPaymentCounter] = PendingPayment(_recipient, _amount, _paymentType, false);
         emit PaymentQueued(pendingPaymentCounter, _recipient, _amount, _paymentType);
     }
 
-    /// @notice Requests an on-ramp operation to convert fiat to cryptocurrency
-    /// @param _fiatAmount Amount of fiat to convert
-    /// @param _targetToken Target cryptocurrency (ETH, USDC, SONIC)
-    /// @param _providerReference Reference string for the provider
-    function requestOnRamp(uint256 _fiatAmount, PaymentType _targetToken, string calldata _providerReference) 
+    /// @notice Requests an on-ramp operation
+    /// @param _fiatAmount Fiat amount to convert
+    /// @param _targetToken Target token (ETH, USDC, SONIC)
+    /// @param _providerReference Provider reference (hashed off-chain)
+    function requestOnRamp(uint256 _fiatAmount, ITelemedicinePayments.PaymentType _targetToken, bytes32 _providerReference) 
         external 
         payable 
         onlyRole(core.PATIENT_ROLE()) 
@@ -236,48 +259,50 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         emit OnRampRequested(onRampCounter, msg.sender, _fiatAmount, _targetToken, _providerReference);
     }
 
-    /// @notice Fulfills an on-ramp request
-    /// @param _requestId ID of the on-ramp request
-    /// @param _oracleSignatures Array of oracle signatures for consensus
-    function fulfillOnRamp(uint256 _requestId, bytes[] calldata _oracleSignatures) 
+    /// @notice Batch fulfills on-ramp requests
+    /// @param _requestIds Array of request IDs
+    /// @param _oracleSignatures Array of signature arrays for consensus
+    function batchFulfillOnRamp(uint256[] calldata _requestIds, bytes[][] calldata _oracleSignatures) 
         external 
         onlyRole(core.ADMIN_ROLE()) 
         nonReentrant 
         whenNotPaused 
     {
-        OnRampRequest storage request = onRampRequests[_requestId];
-        if (request.status != OnRampStatus.Pending) revert InvalidStatus();
-        if (!_verifyMultiOracleConsensus(_requestId, request.cryptoAmount, _oracleSignatures)) revert NotAuthorized();
+        if (_requestIds.length > MAX_ITERATIONS) revert InvalidInput();
+        for (uint256 i = 0; i < _requestIds.length; i++) {
+            OnRampRequest storage request = onRampRequests[_requestIds[i]];
+            if (request.status != OnRampStatus.Pending) continue;
+            if (!_verifyMultiOracleConsensus(_requestIds[i], request.cryptoAmount, _oracleSignatures[i])) continue;
 
-        request.status = OnRampStatus.Fulfilled;
-        _releasePayment(request.user, request.cryptoAmount, request.targetToken);
-        emit OnRampFulfilled(_requestId, request.user, request.cryptoAmount);
+            request.status = OnRampStatus.Fulfilled;
+            _releasePayment(request.user, request.cryptoAmount, request.targetToken);
+            emit OnRampFulfilled(_requestIds[i], request.user, request.cryptoAmount);
+        }
     }
 
-    /// @notice Marks an on-ramp request as failed and refunds the fee
-    /// @param _requestId ID of the on-ramp request
-    /// @param _reason Reason for failure
+    /// @notice Marks an on-ramp request as failed
+    /// @param _requestId Request ID
+    /// @param _reason Failure reason
     function failOnRamp(uint256 _requestId, string calldata _reason) 
         external 
         onlyRole(core.ADMIN_ROLE()) 
         whenNotPaused 
     {
         OnRampRequest storage request = onRampRequests[_requestId];
-        if (request.status != OnRampStatus.Pending) revert InvalidStatus();
+        if (request.status != OnRampStatus.Pending) revert InvalidRequestStatus();
         request.status = OnRampStatus.Failed;
-        
-        // Refund the fee paid
+
         if (request.feePaid > 0 && address(this).balance >= request.feePaid) {
             _safeTransferETH(request.user, request.feePaid);
         }
         emit OnRampFailed(_requestId, request.user, _reason);
     }
 
-    /// @notice Requests an off-ramp operation to convert cryptocurrency to fiat
-    /// @param _sourceToken Source cryptocurrency (ETH, USDC, SONIC)
-    /// @param _cryptoAmount Amount of cryptocurrency to convert
-    /// @param _bankDetails Bank details for fiat transfer
-    function requestOffRamp(PaymentType _sourceToken, uint256 _cryptoAmount, string calldata _bankDetails) 
+    /// @notice Requests an off-ramp operation
+    /// @param _sourceToken Source token (ETH, USDC, SONIC)
+    /// @param _cryptoAmount Crypto amount to convert
+    /// @param _bankDetails Bank details (hashed off-chain)
+    function requestOffRamp(ITelemedicinePayments.PaymentType _sourceToken, uint256 _cryptoAmount, bytes32 _bankDetails) 
         external 
         payable 
         onlyRole(core.PATIENT_ROLE()) 
@@ -289,16 +314,18 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         if (msg.value < dynamicFee) revert InsufficientFunds();
 
         uint256 fiatAmount = _calculateFiatAmount(_cryptoAmount, _sourceToken);
-        if (_sourceToken == PaymentType.ETH) {
+        if (_sourceToken == ITelemedicinePayments.PaymentType.ETH) {
             uint256 requiredEth = _cryptoAmount.add(dynamicFee);
             if (msg.value < requiredEth) revert InsufficientFunds();
             if (msg.value > requiredEth) {
                 _safeTransferETH(msg.sender, msg.value.sub(requiredEth));
             }
-        } else if (_sourceToken == PaymentType.USDC) {
+        } else if (_sourceToken == ITelemedicinePayments.PaymentType.USDC) {
             usdcToken.safeTransferFrom(msg.sender, address(this), _cryptoAmount);
-        } else if (_sourceToken == PaymentType.SONIC) {
+        } else if (_sourceToken == ITelemedicinePayments.PaymentType.SONIC) {
             sonicToken.safeTransferFrom(msg.sender, address(this), _cryptoAmount);
+        } else {
+            revert InvalidRequestStatus();
         }
 
         offRampCounter = offRampCounter.add(1);
@@ -317,8 +344,8 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         emit OffRampRequested(offRampCounter, msg.sender, _sourceToken, _cryptoAmount, _bankDetails);
     }
 
-    /// @notice Locks an off-ramp request for processing
-    /// @param _requestId ID of the off-ramp request
+    /// @notice Locks an off-ramp request
+    /// @param _requestId Request ID
     function lockOffRamp(uint256 _requestId) 
         external 
         onlyRole(core.ADMIN_ROLE()) 
@@ -326,31 +353,34 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         whenNotPaused 
     {
         OffRampRequest storage request = offRampRequests[_requestId];
-        if (request.status != OffRampStatus.Pending) revert InvalidStatus();
+        if (request.status != OffRampStatus.Pending) revert InvalidRequestStatus();
         request.status = OffRampStatus.Locked;
         emit OffRampLocked(_requestId, request.user, request.cryptoAmount);
     }
 
-    /// @notice Fulfills a locked off-ramp request
-    /// @param _requestId ID of the off-ramp request
-    /// @param _oracleSignatures Array of oracle signatures for consensus
-    function fulfillOffRamp(uint256 _requestId, bytes[] calldata _oracleSignatures) 
+    /// @notice Batch fulfills off-ramp requests
+    /// @param _requestIds Array of request IDs
+    /// @param _oracleSignatures Array of signature arrays for consensus
+    function batchFulfillOffRamp(uint256[] calldata _requestIds, bytes[][] calldata _oracleSignatures) 
         external 
         onlyRole(core.ADMIN_ROLE()) 
         nonReentrant 
         whenNotPaused 
     {
-        OffRampRequest storage request = offRampRequests[_requestId];
-        if (request.status != OffRampStatus.Locked) revert InvalidStatus();
-        if (!_verifyMultiOracleConsensus(_requestId, request.fiatAmount, _oracleSignatures)) revert NotAuthorized();
+        if (_requestIds.length > MAX_ITERATIONS) revert InvalidInput();
+        for (uint256 i = 0; i < _requestIds.length; i++) {
+            OffRampRequest storage request = offRampRequests[_requestIds[i]];
+            if (request.status != OffRampStatus.Locked) continue;
+            if (!_verifyMultiOracleConsensus(_requestIds[i], request.fiatAmount, _oracleSignatures[i])) continue;
 
-        request.status = OffRampStatus.Fulfilled;
-        emit OffRampFulfilled(_requestId, request.user, request.fiatAmount);
+            request.status = OffRampStatus.Fulfilled;
+            emit OffRampFulfilled(_requestIds[i], request.user, request.fiatAmount);
+        }
     }
 
-    /// @notice Marks an off-ramp request as failed and refunds the user
-    /// @param _requestId ID of the off-ramp request
-    /// @param _reason Reason for failure
+    /// @notice Marks an off-ramp request as failed
+    /// @param _requestId Request ID
+    /// @param _reason Failure reason
     function failOffRamp(uint256 _requestId, string calldata _reason) 
         external 
         onlyRole(core.ADMIN_ROLE()) 
@@ -358,65 +388,53 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         whenNotPaused 
     {
         OffRampRequest storage request = offRampRequests[_requestId];
-        if (request.status != OffRampStatus.Pending && request.status != OffRampStatus.Locked) revert InvalidStatus();
+        if (request.status != OffRampStatus.Pending && request.status != OffRampStatus.Locked) revert InvalidRequestStatus();
         request.status = OffRampStatus.Failed;
 
         refundPatient(request.user, request.cryptoAmount, request.sourceToken, _requestId);
         emit OffRampFailed(_requestId, request.user, _reason);
     }
 
-    /// @notice Updates the on-ramp provider address
-    /// @param _newProvider New provider address
-    function updateOnRampProvider(address _newProvider) external onlyRole(core.ADMIN_ROLE()) {
-        if (_newProvider == address(0)) revert InvalidAddress();
-        address oldProvider = onRampProvider;
-        onRampProvider = _newProvider;
-        emit OnRampProviderUpdated(oldProvider, _newProvider);
+    /// @notice Updates configuration parameters
+    /// @param _parameter Parameter name
+    /// @param _value New value (address or uint256)
+    function updateConfiguration(string memory _parameter, address _value) external onlyConfigAdmin {
+        bytes32 paramHash = keccak256(abi.encodePacked(_parameter));
+        if (_value == address(0)) revert InvalidAddress();
+
+        if (paramHash == keccak256(abi.encodePacked("onRampProvider"))) {
+            address oldProvider = onRampProvider;
+            onRampProvider = _value;
+            emit ProviderUpdated("onRamp", oldProvider, _value);
+        } else if (paramHash == keccak256(abi.encodePacked("offRampProvider"))) {
+            address oldProvider = offRampProvider;
+            offRampProvider = _value;
+            emit ProviderUpdated("offRamp", oldProvider, _value);
+        } else if (paramHash == keccak256(abi.encodePacked("ethUsdPriceFeed"))) {
+            address oldFeed = address(ethUsdPriceFeed);
+            ethUsdPriceFeed = AggregatorV3Interface(_value);
+            _updateTrustedOracle(oldFeed, _value);
+            emit PriceFeedUpdated("ETH/USD", oldFeed, _value);
+        } else if (paramHash == keccak256(abi.encodePacked("sonicUsdPriceFeed"))) {
+            address oldFeed = address(sonicUsdPriceFeed);
+            sonicUsdPriceFeed = AggregatorV3Interface(_value);
+            _updateTrustedOracle(oldFeed, _value);
+            emit PriceFeedUpdated("Sonic/USD", oldFeed, _value);
+        } else if (paramHash == keccak256(abi.encodePacked("usdFiatOracle"))) {
+            address oldFeed = address(usdFiatOracle);
+            usdFiatOracle = AggregatorV3Interface(_value);
+            _updateTrustedOracle(oldFeed, _value);
+            emit PriceFeedUpdated("USD/Fiat", oldFeed, _value);
+        } else {
+            revert InvalidConfiguration();
+        }
     }
 
-    /// @notice Updates the off-ramp provider address
-    /// @param _newProvider New provider address
-    function updateOffRampProvider(address _newProvider) external onlyRole(core.ADMIN_ROLE()) {
-        if (_newProvider == address(0)) revert InvalidAddress();
-        address oldProvider = offRampProvider;
-        offRampProvider = _newProvider;
-        emit OffRampProviderUpdated(oldProvider, _newProvider);
-    }
-
-    /// @notice Updates the ETH/USD price feed address
-    /// @param _newFeed New price feed address
-    function updateEthUsdPriceFeed(address _newFeed) external onlyRole(core.ADMIN_ROLE()) {
-        if (_newFeed == address(0)) revert InvalidAddress();
-        address oldFeed = address(ethUsdPriceFeed);
-        ethUsdPriceFeed = AggregatorV3Interface(_newFeed);
-        _updateTrustedOracle(oldFeed, _newFeed);
-        emit PriceFeedUpdated("ETH/USD", oldFeed, _newFeed);
-    }
-
-    /// @notice Updates the SONIC/USD price feed address
-    /// @param _newFeed New price feed address
-    function updateSonicUsdPriceFeed(address _newFeed) external onlyRole(core.ADMIN_ROLE()) {
-        if (_newFeed == address(0)) revert InvalidAddress();
-        address oldFeed = address(sonicUsdPriceFeed);
-        sonicUsdPriceFeed = AggregatorV3Interface(_newFeed);
-        _updateTrustedOracle(oldFeed, _newFeed);
-        emit PriceFeedUpdated("Sonic/USD", oldFeed, _newFeed);
-    }
-
-    /// @notice Updates the USD/Fiat oracle address
-    /// @param _newOracle New oracle address
-    function updateUsdFiatOracle(address _newOracle) external onlyRole(core.ADMIN_ROLE()) {
-        if (_newOracle == address(0)) revert InvalidAddress();
-        address oldFeed = address(usdFiatOracle);
-        usdFiatOracle = AggregatorV3Interface(_newOracle);
-        _updateTrustedOracle(oldFeed, _newOracle);
-        emit PriceFeedUpdated("USD/Fiat", oldFeed, _newOracle);
-    }
-
-    /// @notice Updates the on-ramp or off-ramp fee
-    /// @param _rampType Type of ramp ("onRamp" or "offRamp")
+    /// @notice Updates ramp fees
+    /// @param _rampType Ramp type ("onRamp" or "offRamp")
     /// @param _newFee New fee in USD (18 decimals)
-    function updateRampFee(string calldata _rampType, uint256 _newFee) external onlyRole(core.ADMIN_ROLE()) {
+    function updateRampFee(string calldata _rampType, uint256 _newFee) external onlyConfigAdmin {
+        if (_newFee < MIN_FEE_USD || _newFee > maxFeeCapUsd.mul(10**12)) revert InvalidFee(); // Adjust for USDC decimals
         bytes32 rampHash = keccak256(abi.encodePacked(_rampType));
         if (rampHash == keccak256("onRamp")) {
             uint256 oldFee = onRampFee;
@@ -427,63 +445,102 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
             offRampFee = _newFee;
             emit RampFeeUpdated("offRamp", oldFee, _newFee);
         } else {
-            revert("Invalid ramp type");
+            revert InvalidConfiguration();
         }
     }
 
-    /// @notice Processes a payment in ETH, USDC, or SONIC tokens
+    /// @notice Processes a payment
     /// @param _type Payment type (ETH, USDC, SONIC)
     /// @param _amount Amount to process
-    function _processPayment(PaymentType _type, uint256 _amount) external payable nonReentrant whenNotPaused {
+    function _processPayment(ITelemedicinePayments.PaymentType _type, uint256 _amount) 
+        external 
+        payable 
+        nonReentrant 
+        whenNotPaused 
+    {
         if (msg.sender != address(operations)) revert NotAuthorized();
-        uint256 reserveAmount = _amount.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
-        uint256 platformAmount = _amount.mul(core.platformFeePercentage()).div(core.PERCENTAGE_DENOMINATOR());
-        uint256 operationId = operations.getOperationId(msg.sender, block.timestamp);
 
-        if (_type == PaymentType.ETH) {
+        // Updated: Cache core parameters
+        uint256 reservePercentage = core.reserveFundPercentage();
+        uint256 platformPercentage = core.platformFeePercentage();
+        uint256 percentageDenominator = core.PERCENTAGE_DENOMINATOR();
+        uint256 reserveAmount = _amount.mul(reservePercentage).div(percentageDenominator);
+        uint256 platformAmount = _amount.mul(platformPercentage).div(percentageDenominator);
+
+        // Updated: Try-catch for operation ID
+        uint256 operationId;
+        try operations.getOperationId(msg.sender, block.timestamp) returns (uint256 id) {
+            operationId = id;
+        } catch {
+            revert ExternalCallFailed();
+        }
+
+        // Updated: Validate reserve fund
+        uint256 currentReserve = core.getReserveFundBalance();
+        if (_type == ITelemedicinePayments.PaymentType.ETH) {
             if (msg.value < _amount) revert InsufficientFunds();
-            core.reserveFund = core.reserveFund.add(reserveAmount);
-            if (msg.value > _amount) {
-                _safeTransferETH(msg.sender, msg.value.sub(_amount));
+            if (address(this).balance < currentReserve.add(reserveAmount)) revert InsufficientReserve();
+            try core.updateReserveFund(currentReserve.add(reserveAmount)) {
+                if (msg.value > _amount) {
+                    _safeTransferETH(msg.sender, msg.value.sub(_amount));
+                }
+            } catch {
+                revert ExternalCallFailed();
             }
-        } else if (_type == PaymentType.USDC) {
+        } else if (_type == ITelemedicinePayments.PaymentType.USDC) {
+            if (usdcToken.balanceOf(address(this)) < currentReserve.add(reserveAmount)) revert InsufficientReserve();
             usdcToken.safeTransferFrom(msg.sender, address(this), _amount);
-            usdcToken.safeTransfer(address(this), reserveAmount);
-            core.reserveFund = core.reserveFund.add(reserveAmount);
-        } else if (_type == PaymentType.SONIC) {
+            try core.updateReserveFund(currentReserve.add(reserveAmount)) {} catch {
+                revert ExternalCallFailed();
+            }
+        } else if (_type == ITelemedicinePayments.PaymentType.SONIC) {
+            if (sonicToken.balanceOf(address(this)) < currentReserve.add(reserveAmount)) revert InsufficientReserve();
             sonicToken.safeTransferFrom(msg.sender, address(this), _amount);
-            sonicToken.safeTransfer(address(this), reserveAmount);
-            core.reserveFund = core.reserveFund.add(reserveAmount);
+            try core.updateReserveFund(currentReserve.add(reserveAmount)) {} catch {
+                revert ExternalCallFailed();
+            }
         } else {
-            revert InvalidStatus();
+            revert InvalidRequestStatus();
         }
 
         emit ReserveFundAllocated(operationId, reserveAmount, _type);
         emit PlatformFeeAllocated(operationId, platformAmount, _type);
     }
 
-    /// @notice Refunds a patient from the reserve fund
-    /// @param _patient Address of the patient
+    /// @notice Refunds a patient
+    /// @param _patient Patient address
     /// @param _amount Amount to refund
     /// @param _type Payment type (ETH, USDC, SONIC)
-    /// @param _disputeId ID of the dispute
-    function refundPatient(address _patient, uint256 _amount, PaymentType _type, uint256 _disputeId) 
+    /// @param _disputeId Dispute ID
+    function refundPatient(address _patient, uint256 _amount, ITelemedicinePayments.PaymentType _type, uint256 _disputeId) 
         public 
         onlyDisputeResolution 
         nonReentrant 
         whenNotPaused 
     {
         if (_amount == 0) return;
-        if (core.getReserveFundBalance() < core.minReserveBalance()) revert InsufficientFunds();
-        _releasePayment(_patient, _amount, _type);
-        emit PatientRefunded(_disputeId, _patient, _amount, _type);
+        // Updated: Validate reserve balance
+        try core.getReserveFundBalance() returns (uint256 reserveBalance) {
+            if (reserveBalance < core.minReserveBalance() || reserveBalance < _amount) revert InsufficientReserve();
+            _releasePayment(_patient, _amount, _type);
+            emit PatientRefunded(_disputeId, _patient, _amount, _type);
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
 
-    /// @notice Releases queued payments when funds are available
+    /// @notice Releases queued payments
     /// @param _startId Starting payment ID
-    /// @param _endId Ending payment ID (inclusive)
-    function releasePendingPayments(uint256 _startId, uint256 _endId) external onlyRole(core.ADMIN_ROLE()) nonReentrant {
-        if (_startId > _endId || _endId > pendingPaymentCounter) revert InvalidStatus();
+    /// @param _endId Ending payment ID
+    function releasePendingPayments(uint256 _startId, uint256 _endId) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+        nonReentrant 
+    {
+        if (_startId > _endId || _endId > pendingPaymentCounter) revert InvalidRequestStatus();
+        uint256 iterations = _endId.sub(_startId).add(1);
+        if (iterations > MAX_ITERATIONS) revert InvalidInput();
+
         for (uint256 i = _startId; i <= _endId; i++) {
             PendingPayment storage payment = pendingPayments[i];
             if (payment.processed || payment.amount == 0) continue;
@@ -496,11 +553,18 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         }
     }
 
-    /// @notice Cleans up stale pending payments
+    /// @notice Cleans stale pending payments
     /// @param _startId Starting payment ID
-    /// @param _endId Ending payment ID (inclusive)
-    function cleanPendingPayments(uint256 _startId, uint256 _endId) external onlyRole(core.ADMIN_ROLE()) nonReentrant {
-        if (_startId > _endId || _endId > pendingPaymentCounter) revert InvalidStatus();
+    /// @param _endId Ending payment ID
+    function cleanPendingPayments(uint256 _startId, uint256 _endId) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+        nonReentrant 
+    {
+        if (_startId > _endId || _endId > pendingPaymentCounter) revert InvalidRequestStatus();
+        uint256 iterations = _endId.sub(_startId).add(1);
+        if (iterations > MAX_ITERATIONS) revert InvalidInput();
+
         for (uint256 i = _startId; i <= _endId; i++) {
             PendingPayment storage payment = pendingPayments[i];
             if (payment.processed || payment.amount == 0) continue;
@@ -513,48 +577,62 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
 
     // Internal Functions
 
-    /// @notice Calculates crypto amount from fiat with oracle fallback
-    function _calculateCryptoAmount(uint256 _fiatAmount, PaymentType _targetToken) internal view returns (uint256) {
+    /// @notice Calculates crypto amount from fiat
+    /// @param _fiatAmount Fiat amount
+    /// @param _targetToken Target token
+    /// @return Crypto amount
+    function _calculateCryptoAmount(uint256 _fiatAmount, ITelemedicinePayments.PaymentType _targetToken) 
+        internal 
+        view 
+        returns (uint256) 
+    {
         (, int256 usdPrice, , uint256 updatedAt, ) = usdFiatOracle.latestRoundData();
         bool usdStale = usdPrice <= 0 || block.timestamp > updatedAt + MAX_STALENESS;
         uint256 fiatInUsd = usdStale ? _fiatAmount : _fiatAmount.mul(uint256(usdPrice)).div(10**usdFiatOracle.decimals());
 
-        if (_targetToken == PaymentType.ETH) {
+        if (_targetToken == ITelemedicinePayments.PaymentType.ETH) {
             (, int256 ethPrice, , uint256 ethUpdatedAt, ) = ethUsdPriceFeed.latestRoundData();
             if (ethPrice <= 0 || block.timestamp > ethUpdatedAt + MAX_STALENESS) {
-                if (usdStale) revert OracleFailure(); // No fallback if both fail
+                if (usdStale) revert OracleFailure();
                 return fiatInUsd.mul(10**18).div(2000 * 10**8); // $2000 ETH fallback
             }
             return fiatInUsd.mul(10**18).div(uint256(ethPrice));
-        } else if (_targetToken == PaymentType.USDC) {
-            return fiatInUsd.mul(10**6).div(10**8);
-        } else if (_targetToken == PaymentType.SONIC) {
+        } else if (_targetToken == ITelemedicinePayments.PaymentType.USDC) {
+            return fiatInUsd.mul(10**6).div(10**8); // Updated: Adjust for 6 decimals
+        } else if (_targetToken == ITelemedicinePayments.PaymentType.SONIC) {
             (, int256 sonicPrice, , uint256 sonicUpdatedAt, ) = sonicUsdPriceFeed.latestRoundData();
             if (sonicPrice <= 0 || block.timestamp > sonicUpdatedAt + MAX_STALENESS) {
-                if (usdStale) revert OracleFailure(); // No fallback if both fail
+                if (usdStale) revert OracleFailure();
                 return fiatInUsd.mul(10**18).div(10**8); // $1 SONIC fallback
             }
             return fiatInUsd.mul(10**18).div(uint256(sonicPrice));
         }
-        revert InvalidStatus();
+        revert InvalidRequestStatus();
     }
 
-    /// @notice Calculates fiat amount from crypto with oracle fallback
-    function _calculateFiatAmount(uint256 _cryptoAmount, PaymentType _sourceToken) internal view returns (uint256) {
+    /// @notice Calculates fiat amount from crypto
+    /// @param _cryptoAmount Crypto amount
+    /// @param _sourceToken Source token
+    /// @return Fiat amount
+    function _calculateFiatAmount(uint256 _cryptoAmount, ITelemedicinePayments.PaymentType _sourceToken) 
+        internal 
+        view 
+        returns (uint256) 
+    {
         (, int256 usdPrice, , uint256 updatedAt, ) = usdFiatOracle.latestRoundData();
         bool usdStale = usdPrice <= 0 || block.timestamp > updatedAt + MAX_STALENESS;
         uint256 usdPriceAdjusted = usdStale ? DEFAULT_FIAT_PRICE : uint256(usdPrice);
 
-        if (_sourceToken == PaymentType.ETH) {
+        if (_sourceToken == ITelemedicinePayments.PaymentType.ETH) {
             (, int256 ethPrice, , uint256 ethUpdatedAt, ) = ethUsdPriceFeed.latestRoundData();
             if (ethPrice <= 0 || block.timestamp > ethUpdatedAt + MAX_STALENESS) {
                 if (usdStale) revert OracleFailure();
                 return _cryptoAmount.mul(2000 * 10**8).div(10**18).mul(10**usdFiatOracle.decimals()).div(DEFAULT_FIAT_PRICE);
             }
             return _cryptoAmount.mul(uint256(ethPrice)).div(10**18).mul(10**usdFiatOracle.decimals()).div(usdPriceAdjusted);
-        } else if (_sourceToken == PaymentType.USDC) {
-            return _cryptoAmount.mul(10**8).div(10**6).mul(10**usdFiatOracle.decimals()).div(usdPriceAdjusted);
-        } else if (_sourceToken == PaymentType.SONIC) {
+        } else if (_sourceToken == ITelemedicinePayments.PaymentType.USDC) {
+            return _cryptoAmount.mul(10**8).div(10**6).mul(10**usdFiatOracle.decimals()).div(usdPriceAdjusted); // Updated: Adjust for 6 decimals
+        } else if (_sourceToken == ITelemedicinePayments.PaymentType.SONIC) {
             (, int256 sonicPrice, , uint256 sonicUpdatedAt, ) = sonicUsdPriceFeed.latestRoundData();
             if (sonicPrice <= 0 || block.timestamp > sonicUpdatedAt + MAX_STALENESS) {
                 if (usdStale) revert OracleFailure();
@@ -562,30 +640,45 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
             }
             return _cryptoAmount.mul(uint256(sonicPrice)).div(10**18).mul(10**usdFiatOracle.decimals()).div(usdPriceAdjusted);
         }
-        revert InvalidStatus();
+        revert InvalidRequestStatus();
     }
 
-    /// @notice Calculates dynamic fee in ETH based on USD value
+    /// @notice Calculates dynamic fee in ETH
+    /// @param _baseFeeUsd Base fee in USD (18 decimals)
+    /// @return Fee in ETH
     function _calculateDynamicFee(uint256 _baseFeeUsd) internal view returns (uint256) {
         (, int256 ethPrice, , uint256 updatedAt, ) = ethUsdPriceFeed.latestRoundData();
         if (ethPrice <= 0 || block.timestamp > updatedAt + MAX_STALENESS) {
             return _baseFeeUsd.mul(10**18).div(2000 * 10**8); // $2000 ETH fallback
         }
         uint256 feeInEth = _baseFeeUsd.mul(10**18).div(uint256(ethPrice));
-        return feeInEth > MAX_FEE_CAP_USD.mul(10**18).div(uint256(ethPrice)) ? 
-            MAX_FEE_CAP_USD.mul(10**18).div(uint256(ethPrice)) : feeInEth;
+        uint256 maxFeeInEth = maxFeeCapUsd.mul(10**12).mul(10**18).div(uint256(ethPrice)); // Adjust for USDC decimals
+        return feeInEth > maxFeeInEth ? maxFeeInEth : feeInEth;
     }
 
-    function _verifyMultiOracleConsensus(uint256 _id, uint256 _value, bytes[] calldata _signatures) internal view returns (bool) {
+    /// @notice Verifies multi-oracle consensus
+    /// @param _id Request ID
+    /// @param _value Value to verify
+    /// @param _signatures Oracle signatures
+    /// @return True if consensus reached
+    function _verifyMultiOracleConsensus(uint256 _id, uint256 _value, bytes[] calldata _signatures) 
+        internal 
+        view 
+        returns (bool) 
+    {
         if (_signatures.length < trustedOracles.length / 2 + 1) return false;
-        bytes32 message = keccak256(abi.encode(_id, _value, block.timestamp));
+        // Updated: Include nonce and expiration
+        bytes32 message = keccak256(abi.encode(_id, _value, block.timestamp, nonces[_id]));
         uint256 validSignatures = 0;
+        mapping(address => bool) storage usedSigners = signatureUsed[_id];
 
         for (uint256 i = 0; i < _signatures.length; i++) {
             address signer = recoverSigner(message, _signatures[i]);
+            if (usedSigners[signer]) continue;
             for (uint256 j = 0; j < trustedOracles.length; j++) {
                 if (signer == trustedOracles[j]) {
                     validSignatures = validSignatures.add(1);
+                    usedSigners[signer] = true;
                     break;
                 }
             }
@@ -593,79 +686,196 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         return validSignatures >= trustedOracles.length / 2 + 1;
     }
 
+    /// @notice Updates trusted oracles
+    /// @param _oldOracle Old oracle address
+    /// @param _newOracle New oracle address
     function _updateTrustedOracle(address _oldOracle, address _newOracle) internal {
+        bool found = false;
         for (uint256 i = 0; i < trustedOracles.length; i++) {
             if (trustedOracles[i] == _oldOracle) {
                 trustedOracles[i] = _newOracle;
+                found = true;
                 break;
             }
         }
+        if (!found) revert InvalidAddress();
     }
 
+    /// @notice Safely transfers ETH
+    /// @param _to Recipient address
+    /// @param _amount Amount to transfer
     function _safeTransferETH(address _to, uint256 _amount) internal {
-        (bool success, ) = _to.call{value: _amount}("");
+        // Updated: Fixed gas limit
+        (bool success, ) = _to.call{value: _amount, gas: ETH_TRANSFER_GAS_LIMIT}("");
         if (!success) revert PaymentFailed();
     }
 
-    function _releasePayment(address _to, uint256 _amount, PaymentType _paymentType) internal {
+    /// @notice Releases a payment
+    /// @param _to Recipient address
+    /// @param _amount Amount to release
+    /// @param _paymentType Payment type
+    function _releasePayment(address _to, uint256 _amount, ITelemedicinePayments.PaymentType _paymentType) internal {
         if (!_hasSufficientFunds(_amount, _paymentType)) {
+            if (pendingPaymentCounter >= MAX_PENDING_PAYMENTS) revert CounterOverflow();
             pendingPaymentCounter = pendingPaymentCounter.add(1);
-            pendingPayments[pendingPaymentCounter] = PendingPayment(_to, _amount, _paymentType, false, uint48(block.timestamp));
+            pendingPayments[pendingPaymentCounter] = PendingPayment(_to, _amount, _paymentType, false);
             emit PaymentQueued(pendingPaymentCounter, _to, _amount, _paymentType);
             return;
         }
 
-        if (_paymentType == PaymentType.ETH) {
+        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
             _safeTransferETH(_to, _amount);
-        } else if (_paymentType == PaymentType.USDC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
             usdcToken.safeTransfer(_to, _amount);
-        } else if (_paymentType == PaymentType.SONIC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
             sonicToken.safeTransfer(_to, _amount);
         }
     }
 
-    function _hasSufficientFunds(uint256 _amount, PaymentType _paymentType) internal view returns (bool) {
-        if (_paymentType == PaymentType.ETH) {
+    /// @notice Checks sufficient funds
+    /// @param _amount Amount to check
+    /// @param _paymentType Payment type
+    /// @return True if sufficient funds
+    function _hasSufficientFunds(uint256 _amount, ITelemedicinePayments.PaymentType _paymentType) 
+        internal 
+        view 
+        returns (bool) 
+    {
+        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
             return address(this).balance >= _amount;
-        } else if (_paymentType == PaymentType.USDC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
             return usdcToken.balanceOf(address(this)) >= _amount;
-        } else if (_paymentType == PaymentType.SONIC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
             return sonicToken.balanceOf(address(this)) >= _amount;
         }
         return false;
     }
 
+    /// @notice Recovers signer from a signature
+    /// @param message Message hash
+    /// @param signature Signature bytes
+    /// @return Signer address
     function recoverSigner(bytes32 message, bytes memory signature) internal pure returns (address) {
+        if (signature.length != 65) revert InvalidSignature();
         bytes32 r;
         bytes32 s;
         uint8 v;
-        if (signature.length != 65) revert InvalidStatus();
         assembly {
             r := mload(add(signature, 32))
             s := mload(add(signature, 64))
             v := byte(0, mload(add(signature, 96)))
         }
         if (v < 27) v += 27;
-        if (v != 27 && v != 28) revert InvalidStatus();
-        return ecrecover(message, v, r, s);
+        if (v != 27 && v != 28) revert InvalidSignature();
+        address signer = ecrecover(message, v, r, s);
+        if (signer == address(0)) revert InvalidSignature();
+        return signer;
+    }
+
+    /// @notice Checks if an address is a contract
+    /// @param addr Address to check
+    /// @return True if contract
+    function _isContract(address addr) internal view returns (bool) {
+        uint256 size;
+        assembly {
+            size := extcodesize(addr)
+        }
+        return size > 0;
     }
 
     // Modifiers
+
+    /// @notice Restricts to role
     modifier onlyRole(bytes32 role) {
-        if (!core.hasRole(role, msg.sender)) revert NotAuthorized();
-        _;
+        // Updated: Try-catch for role check
+        try core.hasRole(role, msg.sender) returns (bool hasRole) {
+            if (!hasRole) revert NotAuthorized();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
 
+    /// @notice Restricts to dispute resolution
     modifier onlyDisputeResolution() {
         if (msg.sender != address(disputeResolution)) revert NotAuthorized();
         _;
     }
 
-    modifier whenNotPaused() {
-        if (core.paused()) revert ContractPaused();
-        _;
+    /// @notice Restricts to config admins
+    modifier onlyConfigAdmin() {
+        // Updated: Delegate to core
+        try core.isConfigAdmin(msg.sender) returns (bool isAdmin) {
+            if (!isAdmin) revert NotAuthorized();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
+
+    /// @notice Checks pause state
+    modifier whenNotPaused() {
+        // Updated: Auto-sync pause state
+        try core.paused() returns (bool corePaused) {
+            if (corePaused != paused()) {
+                corePaused ? _pause() : _unpause();
+            }
+            if (paused()) revert ContractPaused();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
+    }
+
+    // View Functions
+
+    /// @notice Gets on-ramp request details
+    /// @param _requestId Request ID
+    /// @return Request details
+    function getOnRampRequest(uint256 _requestId) 
+        external 
+        view 
+        onlyRole(core.ADMIN_ROLE()) 
+        returns (OnRampRequest memory) 
+    {
+        return onRampRequests[_requestId];
+    }
+
+    /// @notice Gets off-ramp request details
+    /// @param _requestId Request ID
+    /// @return Request details
+    function getOffRampRequest(uint256 _requestId) 
+        external 
+        view 
+        onlyRole(core.ADMIN_ROLE()) 
+        returns (OffRampRequest memory) 
+    {
+        return offRampRequests[_requestId];
+    }
+
+    /// @notice Gets pending payment details
+    /// @param _paymentId Payment ID
+    /// @return Payment details
+    function getPendingPayment(uint256 _paymentId) 
+        external 
+        view 
+        onlyRole(core.ADMIN_ROLE()) 
+        returns (PendingPayment memory) 
+    {
+        return pendingPayments[_paymentId];
+    }
+
+    // Storage for signature verification
+    mapping(uint256 => mapping(address => bool)) private signatureUsed;
+    mapping(uint256 => uint256) private nonces;
 
     // Fallback
     receive() external payable {}
+
+    // New: Storage gap
+    uint256[50] private __gap;
+
+    // Errors for new functionality
+    error InvalidInput();
+    error InvalidConfiguration();
 }
