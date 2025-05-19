@@ -6,10 +6,17 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import {SafeMathUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 import {ChainlinkClient, Chainlink} from "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 import {LinkTokenInterface} from "@chainlink/contracts/src/v0.8/interfaces/LinkTokenInterface.sol";
 
+interface IERC20Upgradeable {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+/// @title TelemedicinePayments Interface
+/// @notice Handles payment processing and refunds in ETH, USDC, or SONIC tokens
 interface TelemedicinePayments {
     enum PaymentType { ETH, USDC, SONIC }
     function _processPayment(PaymentType paymentType, uint256 amount) external;
@@ -18,11 +25,15 @@ interface TelemedicinePayments {
     function sonicToken() external view returns (IERC20Upgradeable);
 }
 
+/// @title TelemedicineDisputeResolution Interface
+/// @notice Manages dispute status and outcomes for medical services
 interface TelemedicineDisputeResolution {
     function isDisputed(uint256 id) external view returns (bool);
     function getDisputeOutcome(uint256 id) external view returns (DisputeOutcome);
 }
 
+/// @title TelemedicineMedicalServices Interface
+/// @notice Manages lab tech and pharmacy registration, locality-based searches, and data monetization
 interface TelemedicineMedicalServices {
     function hasLabTechInLocality(string calldata locality) external view returns (bool);
     function hasPharmacyInLocality(string calldata locality) external view returns (bool);
@@ -42,8 +53,10 @@ interface TelemedicineMedicalServices {
     function checkMultiSigApproval(bytes32 operationHash) external view returns (bool);
 }
 
+/// @title TelemedicineCore
+/// @notice Core contract for the telemedicine platform on Sonic Blockchain
+/// @dev UUPS upgradeable, integrates with Chainlink, and manages roles, patients, and gamification
 contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, ChainlinkClient {
-    using SafeMathUpgradeable for uint256;
     using Chainlink for Chainlink.Request;
 
     // Roles
@@ -53,63 +66,52 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     bytes32 public constant LAB_TECH_ROLE = keccak256("LAB_TECH_ROLE");
     bytes32 public constant PHARMACY_ROLE = keccak256("PHARMACY_ROLE");
 
-    // Custom Errors
-    error NotAuthorized();
-    error ContractPaused();
-    error InvalidAddress();
-    error InvalidStatus();
-    error InvalidTimestamp();
-    error InsufficientFunds();
-    error InvalidPercentage();
-
-    // Configuration Variables
-    uint256 public minBookingBuffer;
-    uint256 public minCancellationBuffer;
-    uint256 public verificationTimeout;
-    uint256 public dataMonetizationReward;
-    uint256 public aiAnalysisCost;
-    uint256 public pointsPerLevel;
-    uint8 public maxLevel;
-    uint256 public decayRate;
-    uint256 public decayPeriod;
-    uint256 public freeAnalysisPeriod;
-    uint256 public minReserveBalance;
+    // Configuration Variables with Validation Ranges
+    uint256 public minBookingBuffer; // Minimum: 5 minutes
+    uint256 public minCancellationBuffer; // Minimum: 30 minutes
+    uint256 public verificationTimeout; // Minimum: 1 day, Maximum: 30 days
+    uint256 public dataMonetizationReward; // Minimum: 1e18
+    uint256 public aiAnalysisCost; // Minimum: 0.001 ether
+    uint256 public pointsPerLevel; // Minimum: 10
+    uint8 public maxLevel; // Maximum: 50
+    uint256 public decayRate; // Maximum: 50%
+    uint256 public decayPeriod; // Minimum: 7 days
+    uint256 public freeAnalysisPeriod; // Minimum: 7 days
+    uint256 public minReserveBalance; // Minimum: 0.1 ether
     uint256 public versionNumber;
-    uint256 public doctorFeePercentage;
-    uint256 public reserveFundPercentage;
-    uint256 public platformFeePercentage;
+    uint256 public doctorFeePercentage; // 0-100%
+    uint256 public reserveFundPercentage; // 0-100%
+    uint256 public platformFeePercentage; // 0-100%
     uint256 public constant PERCENTAGE_DENOMINATOR = 100;
-    uint48 public disputeWindow;
-    uint256 public maxBatchSize;
-    uint256 public cancellationFeePercentage;
-    uint48 public reminderInterval;
-    uint48 public paymentConfirmationDeadline;
-    uint48 public invitationExpirationPeriod;
-    uint256 public maxDoctorsPerAppointment;
+    uint48 public disputeWindow; // Minimum: 1 day
+    uint256 public maxBatchSize; // Minimum: 10
+    uint256 public cancellationFeePercentage; // 0-100%
+    uint48 public reminderInterval; // Minimum: 1 hour
+    uint48 public paymentConfirmationDeadline; // Minimum: 1 day
+    uint48 public invitationExpirationPeriod; // Minimum: 7 days
+    uint256 public maxDoctorsPerAppointment; // Minimum: 1, Maximum: 5
 
     // Chainlink Configuration
     address public chainlinkOracle;
     bytes32 public priceListJobId;
-    uint256 public chainlinkFee;
+    uint256 public chainlinkFee; // Minimum: 0.01 ether
     LinkTokenInterface public linkToken;
-    uint48 public chainlinkRequestTimeout;
-    bool public manualPriceOverride;
 
     // Constants
     uint256 public constant MAX_ADMINS = 10;
+    uint256 public constant MIN_LINK_BALANCE = 1 ether; // New: Ensure sufficient LINK for oracle requests
 
     // State Variables
     mapping(address => Patient) public patients;
     mapping(address => Doctor) public doctors;
     mapping(address => LabTechnician) public labTechnicians;
     mapping(address => Pharmacy) public pharmacies;
-    mapping(uint8 => uint256) public discountLevels;
+    mapping(uint8 => uint256) public discountLevels; // Configurable discounts per level
     mapping(string => uint256) public pointsForActions;
     address[] public admins;
     uint256 public aiAnalysisFund;
     uint256 public reserveFund;
-    address[] public multiSigSigners;
-    uint256 public requiredSignatures;
+    mapping(bytes32 => uint256) public chainlinkRequestToPrice; // New: Track Chainlink requests
 
     // Structs
     struct Patient {
@@ -120,7 +122,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         uint48 registrationTimestamp;
         uint48 lastActivityTimestamp;
         uint48 lastFreeAnalysisTimestamp;
-        string encryptedSymmetricKey;
+        bytes32 encryptedSymmetricKeyHash; // Updated: Store hash instead of raw key
     }
 
     struct GamificationData {
@@ -147,6 +149,30 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     // Enums
     enum DataSharingStatus { Disabled, Enabled }
     enum DisputeOutcome { Unresolved, PatientFavored, ProviderFavored, MutualAgreement }
+    // New: Configuration parameter enum for safer updates
+    enum ConfigParameter {
+        DoctorFeePercentage,
+        ReserveFundPercentage,
+        PlatformFeePercentage,
+        DisputeWindow,
+        MaxBatchSize,
+        CancellationFeePercentage,
+        ReminderInterval,
+        PaymentConfirmationDeadline,
+        InvitationExpirationPeriod,
+        MaxDoctorsPerAppointment,
+        ChainlinkFee,
+        MinBookingBuffer,
+        MinCancellationBuffer,
+        VerificationTimeout,
+        DataMonetizationReward,
+        AIAnalysisCost,
+        PointsPerLevel,
+        DecayRate,
+        DecayPeriod,
+        FreeAnalysisPeriod,
+        MinReserveBalance
+    }
 
     // External Contracts
     TelemedicinePayments public payments;
@@ -167,13 +193,36 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     event MinBalanceAlert(address indexed contractAddress, uint256 balance);
     event AuditLog(uint256 indexed timestamp, address indexed actor, string action);
     event DisputeResolutionUpdated(address indexed oldAddress, address indexed newAddress);
-    event ConfigurationUpdated(string parameter, uint256 value);
+    event ConfigurationUpdated(ConfigParameter parameter, uint256 value);
+    event ChainlinkPriceReceived(bytes32 requestId, uint256 price); // New: Chainlink response event
+
+    // Custom Errors
+    error TelemedicineCore__InvalidAddress();
+    error TelemedicineCore__InvalidStatus();
+    error TelemedicineCore__InvalidTimestamp();
+    error TelemedicineCore__InsufficientFunds();
+    error TelemedicineCore__InvalidPercentage();
+    error TelemedicineCore__NotAuthorized();
+    error TelemedicineCore__ContractPaused();
+    error TelemedicineCore__InvalidAdminCount();
+    error TelemedicineCore__UnknownParameter();
+    error TelemedicineCore__InvalidMultiSigConfig();
+    error TelemedicineCore__InvalidParameterValue();
+    error TelemedicineCore__InsufficientLinkBalance(); // New: LINK token balance error
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
+    /// @notice Initializes the contract with initial admins and external contract addresses
+    /// @param _initialAdmins List of initial admin addresses
+    /// @param _payments Address of TelemedicinePayments contract
+    /// @param _disputeResolution Address of TelemedicineDisputeResolution contract
+    /// @param _services Address of TelemedicineMedicalServices contract
+    /// @param _chainlinkOracle Address of Chainlink oracle
+    /// @param _priceListJobId Chainlink job ID for price feeds
+    /// @param _linkToken Address of LINK token on Sonic
     function initialize(
         address[] memory _initialAdmins,
         address _payments,
@@ -181,14 +230,11 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         address _services,
         address _chainlinkOracle,
         bytes32 _priceListJobId,
-        address _linkToken,
-        address[] memory _multiSigSigners,
-        uint256 _requiredSignatures
+        address _linkToken
     ) external initializer {
-        require(_initialAdmins.length >= 2 && _initialAdmins.length <= MAX_ADMINS, "Invalid initial admin count");
+        if (_initialAdmins.length < 2 || _initialAdmins.length > MAX_ADMINS) revert TelemedicineCore__InvalidAdminCount();
         if (_payments == address(0) || _disputeResolution == address(0) || _services == address(0) ||
-            _chainlinkOracle == address(0) || _linkToken == address(0)) revert InvalidAddress();
-        if (_multiSigSigners.length < _requiredSignatures || _requiredSignatures == 0) revert InvalidAddress();
+            _chainlinkOracle == address(0) || _linkToken == address(0)) revert TelemedicineCore__InvalidAddress();
 
         __UUPSUpgradeable_init();
         __AccessControl_init();
@@ -202,12 +248,11 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         _setRoleAdmin(LAB_TECH_ROLE, ADMIN_ROLE);
         _setRoleAdmin(PHARMACY_ROLE, ADMIN_ROLE);
 
-        for (uint256 i = 0; i < _initialAdmins.length; i++) {
-            require(_initialAdmins[i] != address(0), "Admin address cannot be zero");
-            _grantRole(ADMIN_ROLE, _initialAdmins[i]);
-            admins.push(_initialAdmins[i]);
-        }
+        // New: Batch role assignment for gas efficiency
+        _grantBatchRoles(ADMIN_ROLE, _initialAdmins);
+        admins = _initialAdmins;
 
+        // Updated: Initialize with validated parameters
         minBookingBuffer = 15 minutes;
         minCancellationBuffer = 1 hours;
         verificationTimeout = 7 days;
@@ -243,60 +288,95 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         priceListJobId = _priceListJobId;
         linkToken = LinkTokenInterface(_linkToken);
         chainlinkFee = 0.1 ether;
-        chainlinkRequestTimeout = 30 minutes;
-        manualPriceOverride = false;
-        multiSigSigners = _multiSigSigners;
-        requiredSignatures = _requiredSignatures;
 
         emit AuditLog(block.timestamp, msg.sender, "Contract Initialized");
     }
 
+    /// @notice Authorizes contract upgrades (admin only)
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(ADMIN_ROLE) {
-        versionNumber = versionNumber.add(1);
+        versionNumber += 1;
         emit AuditLog(block.timestamp, msg.sender, "Contract Upgraded");
     }
 
-    // Configuration Functions
-    function updateConfiguration(string calldata _parameter, uint256 _value) external onlyRole(ADMIN_ROLE) {
-        bytes32 paramHash = keccak256(abi.encodePacked(_parameter));
-        if (paramHash == keccak256("doctorFeePercentage")) {
-            if (_value > 100) revert InvalidPercentage();
+    /// @notice Updates configuration parameters (admin only)
+    /// @param _parameter Enum-based parameter to update
+    /// @param _value New value for the parameter
+    function updateConfiguration(ConfigParameter _parameter, uint256 _value) external onlyRole(ADMIN_ROLE) {
+        // New: Enum-based parameter validation
+        if (_parameter == ConfigParameter.DoctorFeePercentage) {
+            if (_value > 100) revert TelemedicineCore__InvalidPercentage();
             doctorFeePercentage = _value;
-        } else if (paramHash == keccak256("reserveFundPercentage")) {
-            if (_value > 100) revert InvalidPercentage();
+        } else if (_parameter == ConfigParameter.ReserveFundPercentage) {
+            if (_value > 100) revert TelemedicineCore__InvalidPercentage();
             reserveFundPercentage = _value;
-        } else if (paramHash == keccak256("platformFeePercentage")) {
-            if (_value > 100) revert InvalidPercentage();
+        } else if (_parameter == ConfigParameter.PlatformFeePercentage) {
+            if (_value > 100) revert TelemedicineCore__InvalidPercentage();
             platformFeePercentage = _value;
-        } else if (paramHash == keccak256("disputeWindow")) {
+        } else if (_parameter == ConfigParameter.DisputeWindow) {
+            if (_value < 1 days || _value > 30 days) revert TelemedicineCore__InvalidParameterValue();
             disputeWindow = uint48(_value);
-        } else if (paramHash == keccak256("maxBatchSize")) {
+        } else if (_parameter == ConfigParameter.MaxBatchSize) {
+            if (_value < 10) revert TelemedicineCore__InvalidParameterValue();
             maxBatchSize = _value;
-        } else if (paramHash == keccak256("cancellationFeePercentage")) {
-            if (_value > 100) revert InvalidPercentage();
+        } else if (_parameter == ConfigParameter.CancellationFeePercentage) {
+            if (_value > 100) revert TelemedicineCore__InvalidPercentage();
             cancellationFeePercentage = _value;
-        } else if (paramHash == keccak256("reminderInterval")) {
+        } else if (_parameter == ConfigParameter.ReminderInterval) {
+            if (_value < 1 hours) revert TelemedicineCore__InvalidParameterValue();
             reminderInterval = uint48(_value);
-        } else if (paramHash == keccak256("paymentConfirmationDeadline")) {
+        } else if (_parameter == ConfigParameter.PaymentConfirmationDeadline) {
+            if (_value < 1 days) revert TelemedicineCore__InvalidParameterValue();
             paymentConfirmationDeadline = uint48(_value);
-        } else if (paramHash == keccak256("invitationExpirationPeriod")) {
+        } else if (_parameter == ConfigParameter.InvitationExpirationPeriod) {
+            if (_value < 7 days) revert TelemedicineCore__InvalidParameterValue();
             invitationExpirationPeriod = uint48(_value);
-        } else if (paramHash == keccak256("maxDoctorsPerAppointment")) {
+        } else if (_parameter == ConfigParameter.MaxDoctorsPerAppointment) {
+            if (_value < 1 || _value > 5) revert TelemedicineCore__InvalidParameterValue();
             maxDoctorsPerAppointment = _value;
-        } else if (paramHash == keccak256("chainlinkFee")) {
+        } else if (_parameter == ConfigParameter.ChainlinkFee) {
+            if (_value < 0.01 ether) revert TelemedicineCore__InvalidParameterValue();
             chainlinkFee = _value;
+        } else if (_parameter == ConfigParameter.MinBookingBuffer) {
+            if (_value < 5 minutes) revert TelemedicineCore__InvalidParameterValue();
+            minBookingBuffer = _value;
+        } else if (_parameter == ConfigParameter.MinCancellationBuffer) {
+            if (_value < 30 minutes) revert TelemedicineCore__InvalidParameterValue();
+            minCancellationBuffer = _value;
+        } else if (_parameter == ConfigParameter.VerificationTimeout) {
+            if (_value < 1 days || _value > 30 days) revert TelemedicineCore__InvalidParameterValue();
+            verificationTimeout = _value;
+        } else if (_parameter == ConfigParameter.DataMonetizationReward) {
+            if (_value < 1e18) revert TelemedicineCore__InvalidParameterValue();
+            dataMonetizationReward = _value;
+        } else if (_parameter == ConfigParameter.AIAnalysisCost) {
+            if (_value < 0.001 ether) revert TelemedicineCore__InvalidParameterValue();
+            aiAnalysisCost = _value;
+        } else if (_parameter == ConfigParameter.PointsPerLevel) {
+            if (_value < 10) revert TelemedicineCore__InvalidParameterValue();
+            pointsPerLevel = _value;
+        } else if (_parameter == ConfigParameter.DecayRate) {
+            if (_value > 50) revert TelemedicineCore__InvalidParameterValue();
+            decayRate = _value;
+        } else if (_parameter == ConfigParameter.DecayPeriod) {
+            if (_value < 7 days) revert TelemedicineCore__InvalidParameterValue();
+            decayPeriod = _value;
+        } else if (_parameter == ConfigParameter.FreeAnalysisPeriod) {
+            if (_value < 7 days) revert TelemedicineCore__InvalidParameterValue();
+            freeAnalysisPeriod = _value;
+        } else if (_parameter == ConfigParameter.MinReserveBalance) {
+            if (_value < 0.1 ether) revert TelemedicineCore__InvalidParameterValue();
+            minReserveBalance = _value;
         } else {
-            revert("Unknown parameter");
+            revert TelemedicineCore__UnknownParameter();
         }
-        if (paramHash == keccak256("doctorFeePercentage") || paramHash == keccak256("reserveFundPercentage") || paramHash == keccak256("platformFeePercentage")) {
-            if (doctorFeePercentage + reserveFundPercentage + platformFeePercentage != 100) revert InvalidPercentage();
-        }
+        _validatePercentages();
         emit ConfigurationUpdated(_parameter, _value);
     }
 
-    // Patient Functions
-    function registerPatient(string calldata _encryptedSymmetricKey) external whenNotPaused {
-        if (patients[msg.sender].isRegistered) revert InvalidStatus();
+    /// @notice Registers a new patient with a hash of the encrypted symmetric key
+    /// @param _encryptedSymmetricKeyHash Hash of the patient's encrypted symmetric key
+    function registerPatient(bytes32 _encryptedSymmetricKeyHash) external whenNotPaused {
+        if (patients[msg.sender].isRegistered) revert TelemedicineCore__InvalidStatus();
         patients[msg.sender] = Patient(
             true,
             bytes32(0),
@@ -305,15 +385,16 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
             uint48(block.timestamp),
             uint48(block.timestamp),
             0,
-            _encryptedSymmetricKey
+            _encryptedSymmetricKeyHash
         );
         _grantRole(PATIENT_ROLE, msg.sender);
         emit PatientRegistered(msg.sender);
     }
 
-    function toggleDataMonetization(bool _enable) external onlyRole(PATIENT_ROLE) nonReentrant whenNotPaused {
+    /// @notice Toggles data monetization for a patient
+    function toggleDataMonetization(bool _enable) external onlyRole(PATIENT_ROLE) whenNotPaused {
         Patient storage patient = patients[msg.sender];
-        if (!patient.isRegistered) revert InvalidStatus();
+        if (!patient.isRegistered) revert TelemedicineCore__InvalidStatus();
         if (_enable && patient.dataSharing == DataSharingStatus.Disabled) {
             patient.dataSharing = DataSharingStatus.Enabled;
             patient.lastActivityTimestamp = uint48(block.timestamp);
@@ -324,136 +405,205 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         emit DataMonetizationOptIn(msg.sender, _enable);
     }
 
-    function claimDataReward() external onlyRole(PATIENT_ROLE) nonReentrant whenNotPaused {
+    /// @notice Claims data monetization reward for a patient
+    function claimDataReward() external onlyRole(PATIENT_ROLE) whenNotPaused {
         _claimDataReward(msg.sender);
     }
 
-    function decayPoints(address _patient) external nonReentrant whenNotPaused {
-        if (!hasRole(PATIENT_ROLE, _patient)) revert NotAuthorized();
+    /// @notice Decays patient points based on inactivity
+    function decayPoints(address _patient) external whenNotPaused {
+        if (!hasRole(PATIENT_ROLE, _patient)) revert TelemedicineCore__NotAuthorized();
         _decayPoints(_patient);
     }
 
-    function claimFreeAnalysis() external onlyRole(PATIENT_ROLE) nonReentrant whenNotPaused {
+    /// @notice Claims a free AI analysis for a patient
+    function claimFreeAnalysis() external onlyRole(PATIENT_ROLE) whenNotPaused {
         Patient storage patient = patients[msg.sender];
-        if (!patient.isRegistered) revert InvalidStatus();
-        if (block.timestamp < patient.lastFreeAnalysisTimestamp.add(freeAnalysisPeriod)) revert InvalidTimestamp();
-        if (aiAnalysisFund < aiAnalysisCost) revert InsufficientFunds();
+        if (!patient.isRegistered) revert TelemedicineCore__InvalidStatus();
+        if (block.timestamp < patient.lastFreeAnalysisTimestamp + freeAnalysisPeriod) revert TelemedicineCore__InvalidTimestamp();
+        if (aiAnalysisFund < aiAnalysisCost) revert TelemedicineCore__InsufficientFunds();
 
         patient.lastFreeAnalysisTimestamp = uint48(block.timestamp);
-        aiAnalysisFund = aiAnalysisFund.sub(aiAnalysisCost);
+        aiAnalysisFund -= aiAnalysisCost;
         emit FreeAnalysisClaimed(msg.sender);
     }
 
-    // Admin Functions
+    /// @notice Verifies a doctor (admin only)
     function verifyDoctor(address _doctor, string calldata _licenseNumber, uint256 _fee) external onlyRole(ADMIN_ROLE) {
-        if (_doctor == address(0)) revert InvalidAddress();
-        if (_fee > type(uint96).max) revert InsufficientFunds();
+        if (_doctor == address(0)) revert TelemedicineCore__InvalidAddress();
+        if (_fee > type(uint96).max) revert TelemedicineCore__InsufficientFunds();
         doctors[_doctor] = Doctor(true, uint96(_fee), _licenseNumber);
         _grantRole(DOCTOR_ROLE, _doctor);
         emit DoctorVerified(_doctor);
     }
 
+    /// @notice Verifies a lab technician (admin only)
     function verifyLabTechnician(address _labTech, string calldata _licenseNumber) external onlyRole(ADMIN_ROLE) {
-        if (_labTech == address(0)) revert InvalidAddress();
+        if (_labTech == address(0)) revert TelemedicineCore__InvalidAddress();
         labTechnicians[_labTech] = LabTechnician(true, _licenseNumber);
         _grantRole(LAB_TECH_ROLE, _labTech);
         emit LabTechnicianVerified(_labTech);
     }
 
+    /// @notice Registers a pharmacy (admin only)
     function registerPharmacy(address _pharmacy, string calldata _licenseNumber) external onlyRole(ADMIN_ROLE) {
-        if (_pharmacy == address(0)) revert InvalidAddress();
+        if (_pharmacy == address(0)) revert TelemedicineCore__InvalidAddress();
         pharmacies[_pharmacy] = Pharmacy(true, _licenseNumber);
         _grantRole(PHARMACY_ROLE, _pharmacy);
         emit PharmacyRegistered(_pharmacy);
     }
 
+    /// @notice Deposits funds into the AI analysis fund (admin only)
     function depositAIFund() external payable onlyRole(ADMIN_ROLE) {
-        if (msg.value == 0) revert InsufficientFunds();
-        aiAnalysisFund = aiAnalysisFund.add(msg.value);
+        if (msg.value == 0) revert TelemedicineCore__InsufficientFunds();
+        aiAnalysisFund += msg.value;
         emit AIFundDeposited(msg.sender, msg.value);
     }
 
+    /// @notice Deposits funds into the reserve fund (admin only)
     function depositReserveFund() external payable onlyRole(ADMIN_ROLE) {
-        if (msg.value == 0) revert InsufficientFunds();
-        reserveFund = reserveFund.add(msg.value);
+        if (msg.value == 0) revert TelemedicineCore__InsufficientFunds();
+        reserveFund += msg.value;
         emit ReserveFundDeposited(msg.sender, msg.value);
         _checkMinBalance();
     }
 
+    /// @notice Updates the dispute resolution contract (admin only)
     function setDisputeResolution(address _disputeResolution) external onlyRole(ADMIN_ROLE) {
-        if (_disputeResolution == address(0)) revert InvalidAddress();
+        if (_disputeResolution == address(0)) revert TelemedicineCore__InvalidAddress();
         address oldAddress = address(disputeResolution);
         disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
         emit DisputeResolutionUpdated(oldAddress, _disputeResolution);
     }
 
+    /// @notice Pauses the contract (admin only)
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
         emit AuditLog(block.timestamp, msg.sender, "Contract Paused");
     }
 
+    /// @notice Unpauses the contract (admin only)
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
         emit AuditLog(block.timestamp, msg.sender, "Contract Unpaused");
     }
 
+    /// @notice Requests a price feed from Chainlink oracle (admin only)
+    /// @param _serviceId IPFS hash or identifier for the service
+    function requestPriceFeed(string calldata _serviceId) external onlyRole(ADMIN_ROLE) returns (bytes32) {
+        if (linkToken.balanceOf(address(this)) < MIN_LINK_BALANCE) revert TelemedicineCore__InsufficientLinkBalance();
+
+        Chainlink.Request memory request = buildChainlinkRequest(
+            priceListJobId,
+            address(this),
+            this.fulfill.selector
+        );
+        request.add("serviceId", _serviceId);
+        request.add("field", "price");
+        bytes32 requestId = sendChainlinkRequestTo(chainlinkOracle, request, chainlinkFee);
+        return requestId;
+    }
+
+    /// @notice Handles Chainlink oracle response
+    /// @param _requestId The Chainlink request ID
+    /// @param _price The returned price value
+    function fulfill(bytes32 _requestId, uint256 _price) public recordChainlinkFulfillment(_requestId) {
+        chainlinkRequestToPrice[_requestId] = _price;
+        emit ChainlinkPriceReceived(_requestId, _price);
+    }
+
+    /// @notice Grants roles to multiple accounts in a single transaction (admin only)
+    /// @param _role The role to grant
+    /// @param _accounts List of accounts to receive the role
+    function grantBatchRoles(bytes32 _role, address[] calldata _accounts) external onlyRole(ADMIN_ROLE) {
+        if (_accounts.length > maxBatchSize) revert TelemedicineCore__InvalidParameterValue();
+        _grantBatchRoles(_role, _accounts);
+    }
+
+    /// @notice Configures discount levels for patient tiers (admin only)
+    /// @param _level The patient level
+    /// @param _discountPercentage Discount percentage (0-100)
+    function setDiscountLevel(uint8 _level, uint256 _discountPercentage) external onlyRole(ADMIN_ROLE) {
+        if (_level == 0 || _level > maxLevel) revert TelemedicineCore__InvalidParameterValue();
+        if (_discountPercentage > 100) revert TelemedicineCore__InvalidPercentage();
+        discountLevels[_level] = _discountPercentage;
+    }
+
     // Internal Functions
+
+    /// @notice Validates fee percentages sum to 100
+    function _validatePercentages() private view {
+        if (doctorFeePercentage + reserveFundPercentage + platformFeePercentage != 100)
+            revert TelemedicineCore__InvalidPercentage();
+    }
+
+    /// @notice Claims data monetization reward for a patient
     function _claimDataReward(address _patient) internal {
         Patient storage patient = patients[_patient];
-        if (patient.dataSharing != DataSharingStatus.Enabled) revert InvalidStatus();
-        if (block.timestamp <= patient.lastActivityTimestamp) revert InvalidTimestamp();
+        if (patient.dataSharing != DataSharingStatus.Enabled) revert TelemedicineCore__InvalidStatus();
+        if (block.timestamp <= patient.lastActivityTimestamp) revert TelemedicineCore__InvalidTimestamp();
 
-        uint256 timeElapsed = block.timestamp.sub(patient.lastActivityTimestamp);
-        uint256 reward = timeElapsed.mul(dataMonetizationReward).div(1 days);
-        patient.gamification.mediPoints = uint96(
-            patient.gamification.mediPoints.add(reward) > type(uint96).max 
-            ? type(uint96).max 
-            : patient.gamification.mediPoints.add(reward)
-        );
+        uint256 timeElapsed = block.timestamp - patient.lastActivityTimestamp;
+        uint256 reward = (timeElapsed * dataMonetizationReward) / 1 days;
+        uint256 newPoints = patient.gamification.mediPoints + reward;
+        patient.gamification.mediPoints = uint96(newPoints > type(uint96).max ? type(uint96).max : newPoints);
         patient.lastActivityTimestamp = uint48(block.timestamp);
         _levelUp(_patient);
     }
 
+    /// @notice Decays patient points based on inactivity
     function _decayPoints(address _patient) internal {
         Patient storage patient = patients[_patient];
-        if (!patient.isRegistered) revert InvalidStatus();
+        if (!patient.isRegistered) revert TelemedicineCore__InvalidStatus();
 
-        uint256 timeElapsed = block.timestamp.sub(patient.lastActivityTimestamp);
+        uint256 timeElapsed = block.timestamp - patient.lastActivityTimestamp;
         if (timeElapsed >= decayPeriod && patient.gamification.mediPoints > 0) {
-            uint256 periods = timeElapsed.div(decayPeriod);
-            uint256 decayedPoints = patient.gamification.mediPoints.mul(decayRate).mul(periods).div(100);
+            uint256 periods = timeElapsed / decayPeriod;
+            uint256 decayedPoints = (patient.gamification.mediPoints * decayRate * periods) / 100;
             decayedPoints = decayedPoints > patient.gamification.mediPoints ? patient.gamification.mediPoints : decayedPoints;
-            patient.gamification.mediPoints = uint96(patient.gamification.mediPoints.sub(decayedPoints));
+            patient.gamification.mediPoints = uint96(patient.gamification.mediPoints - decayedPoints);
             patient.lastActivityTimestamp = uint48(block.timestamp);
             emit PointsDecayed(_patient, decayedPoints);
         }
     }
 
+    /// @notice Applies a discount based on patient level
     function _applyFeeDiscount(address _patient, uint256 _baseFee) internal view returns (uint256) {
         uint8 level = patients[_patient].gamification.currentLevel;
         uint256 discountPercentage = discountLevels[level];
         if (discountPercentage == 0) return _baseFee;
-        uint256 discount = _baseFee.mul(discountPercentage).div(100);
-        return _baseFee.sub(discount);
+        uint256 discount = (_baseFee * discountPercentage) / 100;
+        return _baseFee - discount;
     }
 
+    /// @notice Checks if a patient qualifies for priority booking
     function _isPriorityBooking(address _patient) internal view returns (bool) {
         return patients[_patient].gamification.currentLevel >= 5;
     }
 
+    /// @notice Levels up a patient based on points
     function _levelUp(address _patient) internal {
         Patient storage patient = patients[_patient];
         GamificationData storage gamification = patient.gamification;
-        uint256 pointsNeeded = uint256(gamification.currentLevel + 1).mul(pointsPerLevel);
+        uint256 pointsNeeded = uint256(gamification.currentLevel + 1) * pointsPerLevel;
         if (gamification.mediPoints >= pointsNeeded && gamification.currentLevel < maxLevel) {
-            gamification.currentLevel = gamification.currentLevel + 1;
+            gamification.currentLevel += 1;
             emit LevelUp(_patient, gamification.currentLevel);
         }
     }
 
+    /// @notice Checks if the contract balance is below the minimum reserve
     function _checkMinBalance() internal {
         if (address(this).balance < minReserveBalance) {
             emit MinBalanceAlert(address(this), address(this).balance);
+        }
+    }
+
+    /// @notice Internal function to grant roles in batch
+    function _grantBatchRoles(bytes32 _role, address[] memory _accounts) internal {
+        for (uint256 i = 0; i < _accounts.length; i++) {
+            if (_accounts[i] == address(0)) revert TelemedicineCore__InvalidAddress();
+            _grantRole(_role, _accounts[i]);
         }
     }
 
@@ -482,25 +632,32 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         return reserveFund;
     }
 
+    function getLinkBalance() external view returns (uint256) {
+        return linkToken.balanceOf(address(this));
+    }
+
     function paused() external view returns (bool) {
         return super.paused();
     }
 
     // Modifiers
     modifier onlyRole(bytes32 role) {
-        if (!hasRole(role, msg.sender)) revert NotAuthorized();
+        if (!hasRole(role, msg.sender)) revert TelemedicineCore__NotAuthorized();
         _;
     }
 
     modifier whenNotPaused() {
-        if (super.paused()) revert ContractPaused();
+        if (super.paused()) revert TelemedicineCore__ContractPaused();
         _;
     }
 
     // Fallback
-    receive() external payable {
+    receive() external payable onlyRole(ADMIN_ROLE) {
+        reserveFund += msg.value;
         emit ReserveFundDeposited(msg.sender, msg.value);
-        reserveFund = reserveFund.add(msg.value);
         _checkMinBalance();
     }
+
+    // New: Storage gap for future upgrades
+    uint256[50] private __gap;
 }
