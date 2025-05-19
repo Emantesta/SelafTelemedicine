@@ -605,4 +605,297 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
             prescriptionPayments[newPrescriptionId] = true;
             emit PrescriptionPaymentConfirmed(newPrescriptionId, prescriptions[newPrescriptionId].patientCost);
             if (msg.value > prescriptions[newPrescriptionId].patientCost) {
-                _safeTransferETH(msg.sender, msg
+                _safeTransferETH(msg.sender, msg.value.sub(prescriptions[newPrescriptionId].patientCost));
+            }
+        }
+
+        emit PrescriptionIssued(newPrescriptionId, _patient, msg.sender, verificationCodeHash, uint48(block.timestamp));
+        try services.monetizeData(_patient) {
+            // Success
+        } catch {
+            // Log failure but don't revert
+        }
+    }
+
+    /// @notice Requests prescription price from Chainlink oracle
+    /// @param _pharmacy Pharmacy address
+    /// @param _medicationIpfsHash IPFS hash of the medication
+    /// @param _prescriptionId Prescription ID
+    function requestPrescriptionPrice(address _pharmacy, string calldata _medicationIpfsHash, uint256 _prescriptionId) internal returns (bytes32) {
+        if (core.manualPriceOverride()) {
+            prescriptions[_prescriptionId].patientCost = 0.005 ether; // Example default
+            prescriptions[_prescriptionId].status = PrescriptionStatus.PaymentPending;
+            prescriptionPaymentDeadlines[_prescriptionId] = uint48(block.timestamp).add(core.paymentConfirmationDeadline());
+            emit PrescriptionPaymentConfirmed(_prescriptionId, prescriptions[_prescriptionId].patientCost);
+            return bytes32(0);
+        }
+        Chainlink.Request memory req = buildChainlinkRequest(core.priceListJobId(), address(this), this.fulfillPrescriptionPrice.selector);
+        req.add("medication", _medicationIpfsHash);
+        req.add("pharmacy", toString(_pharmacy));
+        bytes32 requestId = sendChainlinkRequestTo(core.chainlinkOracle(), req, core.chainlinkFee());
+        requestToPrescriptionId[requestId] = _prescriptionId;
+        requestTimestamps[requestId] = uint48(block.timestamp);
+        return requestId;
+    }
+
+    /// @notice Handles Chainlink prescription price response
+    /// @param _requestId Chainlink request ID
+    /// @param _price Returned price
+    function fulfillPrescriptionPrice(bytes32 _requestId, uint256 _price) public recordChainlinkFulfillment(_requestId) {
+        if (block.timestamp > requestTimestamps[_requestId] + chainlinkTimeout) revert ChainlinkRequestTimeout();
+
+        uint256 prescriptionId = requestToPrescriptionId[_requestId];
+        if (prescriptionId == 0 || prescriptionId > prescriptionCounter) revert InvalidIndex();
+        Prescription storage prescription = prescriptions[prescriptionId];
+        if (prescription.status != PrescriptionStatus.Generated) revert InvalidStatus();
+        if (_price == 0) {
+            prescription.patientCost = 0.005 ether; // Example default
+        } else {
+            prescription.patientCost = _price.mul(120).div(core.PERCENTAGE_DENOMINATOR());
+        }
+
+        prescription.status = PrescriptionStatus.PaymentPending;
+        prescriptionPaymentDeadlines[prescriptionId] = uint48(block.timestamp).add(core.paymentConfirmationDeadline());
+        delete requestToPrescriptionId[_requestId];
+        delete requestTimestamps[_requestId];
+        emit PrescriptionPaymentConfirmed(prescriptionId, prescription.patientCost);
+    }
+
+    // Invitation Functions
+
+    /// @notice Invites a provider to a locality
+    /// @param _locality Locality name
+    /// @param _inviteeContactHash Hash of invitee contact info
+    /// @param _isLabTech Whether the invitee is a lab technician
+    function inviteProvider(string calldata _locality, bytes32 _inviteeContactHash, bool _isLabTech) 
+        external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused 
+    {
+        if (bytes(_locality).length == 0 || _inviteeContactHash == bytes32(0)) revert InvalidLocality();
+
+        bool hasProvider = _isLabTech ? services.hasLabTechInLocality(_locality) : services.hasPharmacyInLocality(_locality);
+        if (hasProvider) revert ProvidersAlreadyExist();
+
+        bytes32 invitationId = keccak256(abi.encodePacked(msg.sender, _locality, _isLabTech, block.timestamp));
+        if (invitations[invitationId].patient != address(0)) revert InvitationAlreadyExists();
+
+        invitationCounter = invitationCounter.add(1);
+        invitations[invitationId] = Invitation({
+            patient: msg.sender,
+            locality: _locality,
+            inviteeContactHash: _inviteeContactHash,
+            isLabTech: _isLabTech,
+            fulfilled: false,
+            expirationTimestamp: uint48(block.timestamp).add(core.invitationExpirationPeriod())
+        });
+
+        emit InvitationSubmitted(invitationId, msg.sender, _locality, _isLabTech);
+    }
+
+    /// @notice Registers an invited provider
+    /// @param _invitationId Invitation ID
+    /// @param _providerAddress Provider address
+    function registerAsInvitedProvider(bytes32 _invitationId, address _providerAddress) 
+        external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused 
+    {
+        Invitation storage invitation = invitations[_invitationId];
+        if (invitation.patient == address(0)) revert InvalidIndex();
+        if (invitation.fulfilled) revert InvalidStatus();
+        if (block.timestamp > invitation.expirationTimestamp) revert InvitationExpired();
+        if (_providerAddress == address(0)) revert InvalidAddress();
+
+        // Updated: Try-catch for registration
+        try invitation.isLabTech ? 
+            services.registerLabTech(_providerAddress, invitation.locality) : 
+            services.registerPharmacy(_providerAddress, invitation.locality) 
+        {
+            invitation.fulfilled = true;
+            emit InvitationFulfilled(_invitationId, _providerAddress);
+        } catch {
+            revert ExternalCallFailed();
+        }
+    }
+
+    // Payment Queue Functions
+
+    /// @notice Processes pending payments in batch
+    /// @param _paymentIds Array of payment IDs to process
+    function processPendingPayments(uint256[] calldata _paymentIds) external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused {
+        for (uint256 i = 0; i < _paymentIds.length; i++) {
+            PendingPayment storage payment = pendingPayments[_paymentIds[i]];
+            if (payment.processed || payment.recipient == address(0)) continue;
+            if (_hasSufficientFunds(payment.amount, payment.paymentType)) {
+                payment.processed = true;
+                if (payment.paymentType == TelemedicinePayments.PaymentType.ETH) {
+                    _safeTransferETH(payment.recipient, payment.amount);
+                } else if (payment.paymentType == TelemedicinePayments.PaymentType.USDC) {
+                    payments.usdcToken().safeTransfer(payment.recipient, payment.amount);
+                } else if (payment.paymentType == TelemedicinePayments.PaymentType.SONIC) {
+                    payments.sonicToken().safeTransfer(payment.recipient, payment.amount);
+                }
+                emit PaymentReleasedFromQueue(_paymentIds[i], payment.recipient, payment.amount);
+            }
+        }
+    }
+
+    // Internal Functions
+
+    /// @notice Adds a pending appointment for a doctor
+    /// @param _doctor Doctor address
+    /// @param _appointmentId Appointment ID
+    function _addPendingAppointment(address _doctor, uint256 _appointmentId) internal {
+        PendingAppointments storage pending = doctorPendingAppointments[_doctor];
+        if (pending.ids.length >= maxPendingAppointments) revert InvalidPageSize();
+        pending.indices[_appointmentId] = pending.ids.length;
+        pending.ids.push(_appointmentId);
+    }
+
+    /// @notice Removes a pending appointment for a doctor
+    /// @param _doctor Doctor address
+    /// @param _appointmentId Appointment ID
+    function _removePendingAppointment(address _doctor, uint256 _appointmentId) internal {
+        PendingAppointments storage pending = doctorPendingAppointments[_doctor];
+        uint256 index = pending.indices[_appointmentId];
+        if (index >= pending.ids.length) revert InvalidIndex();
+
+        if (index != pending.ids.length - 1) {
+            uint256 lastId = pending.ids[pending.ids.length - 1];
+            pending.ids[index] = lastId;
+            pending.indices[lastId] = index;
+        }
+        pending.ids.pop();
+        delete pending.indices[_appointmentId];
+    }
+
+    /// @notice Checks for pending priority appointments
+    /// @param _doctor Doctor address
+    /// @return True if priority appointments exist
+    function _hasPendingPriorityAppointments(address _doctor) internal view returns (bool) {
+        PendingAppointments storage pending = doctorPendingAppointments[_doctor];
+        for (uint256 i = 0; i < pending.ids.length; i++) {
+            if (appointments[pending.ids[i]].isPriority) return true;
+        }
+        return false;
+    }
+
+    /// @notice Selects the best lab technician based on rating, price, and capacity
+    /// @param _testTypeIpfsHash IPFS hash of the test type
+    /// @param _locality Locality for selection
+    /// @return Selected lab technician address
+    function selectBestLabTech(string memory _testTypeIpfsHash, string memory _locality) internal view returns (address) {
+        (address[] memory labTechs, ) = services.getLabTechsInLocality(_locality, 0, core.maxBatchSize());
+        if (labTechs.length == 0) return address(0);
+
+        address bestLabTech = address(0);
+        uint256 highestScore = 0;
+        address fallbackTech = address(0);
+
+        // Updated: Limit loop to maxBatchSize
+        uint256 maxIterations = labTechs.length > core.maxBatchSize() ? core.maxBatchSize() : labTechs.length;
+        for (uint256 i = 0; i < maxIterations; i++) {
+            if (!services.isLabTechRegistered(labTechs[i])) continue;
+            (uint256 price, bool isValid, , ) = services.getLabTestDetails(labTechs[i], _testTypeIpfsHash);
+            if (!isValid || price == 0) continue;
+            uint256 capacity = services.getLabTechCapacity(labTechs[i]);
+            if (capacity == 0) continue;
+
+            if (fallbackTech == address(0)) fallbackTech = labTechs[i];
+            (uint256 avgRating, uint256 ratingCount) = services.getLabTechRating(labTechs[i]);
+            uint256 score = (avgRating > 0 && ratingCount > 0) ? avgRating * ratingCount / price : 0;
+
+            if (score > highestScore) {
+                highestScore = score;
+                bestLabTech = labTechs[i];
+            }
+        }
+        return bestLabTech != address(0) ? bestLabTech : fallbackTech;
+    }
+
+    /// @notice Safely transfers ETH with gas limit
+    /// @param _to Recipient address
+    /// @param _amount Amount to transfer
+    function _safeTransferETH(address _to, uint256 _amount) internal {
+        // Updated: Gas-limited call
+        (bool success, ) = _to.call{value: _amount, gas: 30000}("");
+        if (!success) revert PaymentFailed();
+    }
+
+    /// @notice Releases a payment or queues it if funds are insufficient
+    /// @param _to Recipient address
+    /// @param _amount Amount to transfer
+    /// @param _paymentType Payment type
+    function _releasePayment(address _to, uint256 _amount, TelemedicinePayments.PaymentType _paymentType) internal {
+        if (!_hasSufficientFunds(_amount, _paymentType)) {
+            pendingPaymentCounter = pendingPaymentCounter.add(1);
+            pendingPayments[pendingPaymentCounter] = PendingPayment(_to, _amount, _paymentType, false);
+            emit PaymentQueued(pendingPaymentCounter, _to, _amount, _paymentType);
+            return;
+        }
+
+        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+            _safeTransferETH(_to, _amount);
+        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+            payments.usdcToken().safeTransfer(_to, _amount);
+        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
+            payments.sonicToken().safeTransfer(_to, _amount);
+        }
+    }
+
+    /// @notice Checks if sufficient funds are available
+    /// @param _amount Amount to check
+    /// @param _paymentType Payment type
+    /// @return True if funds are sufficient
+    function _hasSufficientFunds(uint256 _amount, TelemedicinePayments.PaymentType _paymentType) internal view returns (bool) {
+        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+            return address(this).balance >= _amount;
+        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+            return payments.usdcToken().balanceOf(address(this)) >= _amount;
+        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
+            return payments.sonicToken().balanceOf(address(this)) >= _amount;
+        }
+        return false;
+    }
+
+    /// @notice Converts address to string for Chainlink requests
+    /// @param _addr Address to convert
+    /// @return String representation
+    function toString(address _addr) internal pure returns (string memory) {
+        bytes32 value = bytes32(uint256(uint160(_addr)));
+        bytes memory alphabet = "0123456789abcdef";
+        bytes memory str = new bytes(42);
+        str[0] = "0";
+        str[1] = "x";
+        for (uint256 i = 0; i < 20; i++) {
+            str[2 + i * 2] = alphabet[uint8(value[i + 12] >> 4)];
+            str[3 + i * 2] = alphabet[uint8(value[i + 12] & 0x0f)];
+        }
+        return string(str);
+    }
+
+    // Modifiers
+
+    /// @notice Restricts access to a specific role
+    /// @param role The role required
+    modifier onlyRole(bytes32 role) {
+        if (!core.hasRole(role, msg.sender)) revert NotAuthorized();
+        _;
+    }
+
+    /// @notice Ensures the contract is not paused
+    modifier whenNotPaused() {
+        if (core.paused()) revert ContractPaused();
+        _;
+    }
+
+    /// @notice Requires multi-sig approval
+    /// @param _operationHash Operation hash
+    modifier onlyMultiSig(bytes32 _operationHash) {
+        if (!services.checkMultiSigApproval(_operationHash)) revert MultiSigNotApproved();
+        _;
+    }
+
+    // Fallback
+    receive() external payable {}
+
+    // New: Storage gap for future upgrades
+    uint256[50] private __gap;
+}
