@@ -1,186 +1,240 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
-import {Initializable} from "@openzeppelin
-/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin
-/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import {SafeMathUpgradeable} from "@openzeppelin
-/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
-import {IERC20} from "@openzeppelin
-/contracts/token/ERC20/IERC20.sol";
+
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TelemedicineCore} from "./TelemedicineCore.sol";
 import {TelemedicinePayments} from "./TelemedicinePayments.sol";
 import {TelemedicineSubscription} from "./TelemedicineSubscription.sol";
+
+/// @title SimplePaymaster
+/// @notice A paymaster contract for sponsoring gas costs in ERC-4337 UserOps on Sonic Blockchain
+/// @dev Supports ETH, USDC, and SONIC tokens; ensure TelemedicineCore, Payments, and Subscription are deployed on Sonic
 contract SimplePaymaster is Initializable, ReentrancyGuardUpgradeable {
-    using SafeMathUpgradeable for uint256;
+    /// @notice Reference to the TelemedicineCore contract for role and gamification checks
+    TelemedicineCore public core;
+    /// @notice Reference to the TelemedicinePayments contract for token management
+    TelemedicinePayments public payments;
+    /// @notice Reference to the TelemedicineSubscription contract for subscription status
+    TelemedicineSubscription public subscription;
 
-TelemedicineCore public core;
-TelemedicinePayments public payments;
-TelemedicineSubscription public subscription;
-uint256 public constant VERSION = 1;
+    /// @notice Supported sponsor types for gas cost
+    enum SponsorType { ETH, USDC, SONIC }
+    /// @notice Tracks total gas sponsored per user
+    mapping(address => uint256) public sponsoredGasCosts;
 
-// Supported sponsor types for gas cost
-enum SponsorType { ETH, USDC, SONIC }
-mapping(address => uint256) public sponsoredGasCosts; // Tracks total gas sponsored per user
+    /// @notice Emitted when the paymaster is funded
+    event PaymasterFunded(address indexed funder, uint256 amount, SponsorType sponsorType);
+    /// @notice Emitted when gas is sponsored for a UserOp
+    event GasSponsored(address indexed sender, uint256 amount, SponsorType sponsorType);
+    /// @notice Emitted when funds are withdrawn
+    event FundsWithdrawn(address indexed to, uint256 amount, SponsorType sponsorType);
 
-event PaymasterFunded(address indexed funder, uint256 amount, SponsorType sponsorType);
-event GasSponsored(address indexed sender, uint256 amount, SponsorType sponsorType);
-event FundsWithdrawn(address indexed to, uint256 amount, SponsorType sponsorType);
+    /// @notice Structure for ERC-4337 UserOperation
+    struct UserOperation {
+        address sender;
+        uint256 nonce;
+        bytes initCode;
+        bytes callData;
+        uint256 callGasLimit;
+        uint256 verificationGasLimit;
+        uint256 preVerificationGas;
+        uint256 maxFeePerGas;
+        uint256 maxPriorityFeePerGas;
+        bytes paymasterAndData;
+        bytes signature;
+    }
 
-struct UserOperation {
-    address sender;
-    uint256 nonce;
-    bytes initCode;
-    bytes callData;
-    uint256 callGasLimit;
-    uint256 verificationGasLimit;
-    uint256 preVerificationGas;
-    uint256 maxFeePerGas;
-    uint256 maxPriorityFeePerGas;
-    bytes paymasterAndData;
-    bytes signature;
-}
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
 
-/// @custom:oz-upgrades-unsafe-allow constructor
-constructor() {
-    _disableInitializers();
-}
+    /// @notice Initializes the paymaster with core, payments, and subscription contracts
+    /// @param _core Address of the TelemedicineCore contract
+    /// @param _payments Address of the TelemedicinePayments contract
+    /// @param _subscription Address of the TelemedicineSubscription contract
+    function initialize(address _core, address _payments, address _subscription) external initializer {
+        if (_core == address(0)) revert SimplePaymaster__InvalidCoreAddress();
+        if (_payments == address(0)) revert SimplePaymaster__InvalidPaymentsAddress();
+        if (_subscription == address(0)) revert SimplePaymaster__InvalidSubscriptionAddress();
 
-function initialize(address _core, address _payments, address _subscription) external initializer {
-    __ReentrancyGuard_init();
-    core = TelemedicineCore(_core);
-    payments = TelemedicinePayments(_payments);
-    subscription = TelemedicineSubscription(_subscription);
-}
+        __ReentrancyGuard_init();
+        core = TelemedicineCore(_core);
+        payments = TelemedicinePayments(_payments);
+        subscription = TelemedicineSubscription(_subscription);
+    }
 
-// Fund the paymaster with ETH, USDC, or SONIC
-function deposit(SponsorType _sponsorType, uint256 _amount) external payable nonReentrant {
-    require(_amount > 0, "Deposit amount must be greater than zero");
+    /// @notice Funds the paymaster with ETH, USDC, or SONIC
+    /// @param _sponsorType Type of funds (ETH, USDC, SONIC)
+    /// @param _amount Amount to deposit
+    function deposit(SponsorType _sponsorType, uint256 _amount) external payable {
+        if (_amount == 0) revert SimplePaymaster__InvalidDepositAmount();
+        _validateSponsorType(_sponsorType);
 
-    if (_sponsorType == SponsorType.ETH) {
-        require(msg.value == _amount, "ETH amount mismatch");
+        if (_sponsorType == SponsorType.ETH) {
+            if (msg.value != _amount) revert SimplePaymaster__ETHAmountMismatch();
+        } else if (_sponsorType == SponsorType.USDC) {
+            if (msg.value != 0) revert SimplePaymaster__NoETHForUSDCDdeposit();
+            if (!payments.usdcToken().transferFrom(msg.sender, address(this), _amount))
+                revert SimplePaymaster__USDCTransferFailed();
+        } else {
+            if (msg.value != 0) revert SimplePaymaster__NoETHForSONICDeposit();
+            if (!payments.sonicToken().transferFrom(msg.sender, address(this), _amount))
+                revert SimplePaymaster__SONICTransferFailed();
+        }
+
         emit PaymasterFunded(msg.sender, _amount, _sponsorType);
-    } else if (_sponsorType == SponsorType.USDC) {
-        require(msg.value == 0, "No ETH allowed for USDC deposit");
-        require(payments.usdcToken().transferFrom(msg.sender, address(this), _amount), "USDC transfer failed");
-        emit PaymasterFunded(msg.sender, _amount, _sponsorType);
-    } else if (_sponsorType == SponsorType.SONIC) {
-        require(msg.value == 0, "No ETH allowed for SONIC deposit");
-        require(payments.sonicToken().transferFrom(msg.sender, address(this), _amount), "SONIC transfer failed");
-        emit PaymasterFunded(msg.sender, _amount, _sponsorType);
-    } else {
-        revert("Unsupported sponsor type");
     }
-}
 
-// Withdraw funds (admin only)
-function withdraw(address payable to, uint256 amount, SponsorType _sponsorType) external onlyRole(core.ADMIN_ROLE()) nonReentrant {
-    require(to != address(0), "Invalid recipient address");
-    if (_sponsorType == SponsorType.ETH) {
-        require(address(this).balance >= amount, "Insufficient ETH balance");
-        (bool success, ) = to.call{value: amount}("");
-        require(success, "ETH withdrawal failed");
+    /// @notice Withdraws funds (admin only)
+    /// @param to Recipient address
+    /// @param amount Amount to withdraw
+    /// @param _sponsorType Type of funds (ETH, USDC, SONIC)
+    function withdraw(address payable to, uint256 amount, SponsorType _sponsorType) external onlyRole(core.ADMIN_ROLE()) nonReentrant {
+        if (to == address(0)) revert SimplePaymaster__InvalidRecipientAddress();
+        _validateSponsorType(_sponsorType);
+
+        if (_sponsorType == SponsorType.ETH) {
+            if (address(this).balance < amount) revert SimplePaymaster__InsufficientETHBalance();
+            (bool success, ) = to.call{value: amount}("");
+            if (!success) revert SimplePaymaster__ETHWithdrawalFailed();
+        } else if (_sponsorType == SponsorType.USDC) {
+            if (payments.usdcToken().balanceOf(address(this)) < amount) revert SimplePaymaster__InsufficientUSDCBalance();
+            if (!payments.usdcToken().transfer(to, amount)) revert SimplePaymaster__USDCWithdrawalFailed();
+        } else {
+            if (payments.sonicToken().balanceOf(address(this)) < amount) revert SimplePaymaster__InsufficientSONICBalance();
+            if (!payments.sonicToken().transfer(to, amount)) revert SimplePaymaster__SONICWithdrawalFailed();
+        }
+
         emit FundsWithdrawn(to, amount, _sponsorType);
-    } else if (_sponsorType == SponsorType.USDC) {
-        require(payments.usdcToken().balanceOf(address(this)) >= amount, "Insufficient USDC balance");
-        require(payments.usdcToken().transfer(to, amount), "USDC withdrawal failed");
-        emit FundsWithdrawn(to, amount, _sponsorType);
-    } else if (_sponsorType == SponsorType.SONIC) {
-        require(payments.sonicToken().balanceOf(address(this)) >= amount, "Insufficient SONIC balance");
-        require(payments.sonicToken().transfer(to, amount), "SONIC transfer failed");
-        emit FundsWithdrawn(to, amount, _sponsorType);
-    } else {
-        revert("Unsupported sponsor type");
-    }
-}
-
-// ERC-4337 paymaster validation
-function validatePaymasterUserOp(
-    UserOperation calldata userOp,
-    bytes32 /* userOpHash */,
-    uint256 maxCost
-) external view returns (uint256, bytes memory) {
-    require(msg.sender == address(core), "Only TelemedicineCore can call");
-    require(core.hasRole(core.PATIENT_ROLE(), userOp.sender), "Sender is not a patient");
-
-    // Check gamification level (getPatientLevel is part of TelemedicineCore's gamification system)
-    (bool success, bytes memory result) = address(core).staticcall(
-        abi.encodeWithSignature("getPatientLevel(address)", userOp.sender)
-    );
-    require(success && abi.decode(result, (uint8)) > 0, "Patient level too low for sponsorship");
-
-    // Check subscription status
-    (bool isActive, , ) = subscription.getSubscriptionStatus(userOp.sender);
-    require(isActive, "Patient subscription not active");
-
-    // Decode sponsor type from paymasterAndData (first byte after paymaster address)
-    require(userOp.paymasterAndData.length >= 20 + 1, "Invalid paymasterAndData length");
-    bytes memory data = userOp.paymasterAndData;
-    SponsorType sponsorType = SponsorType(uint8(data[20])); // First byte after 20-byte address
-
-    // Validate funds based on sponsor type
-    if (sponsorType == SponsorType.ETH) {
-        require(address(this).balance >= maxCost, "Insufficient ETH funds");
-    } else if (sponsorType == SponsorType.USDC) {
-        require(payments.usdcToken().balanceOf(address(this)) >= maxCost, "Insufficient USDC funds");
-    } else if (sponsorType == SponsorType.SONIC) {
-        require(payments.sonicToken().balanceOf(address(this)) >= maxCost, "Insufficient SONIC funds");
-    } else {
-        revert("Unsupported sponsor type");
     }
 
-    return (0, abi.encode(sponsorType)); // 0 = valid, context = sponsorType
-}
+    /// @notice Validates a UserOp for gas sponsorship
+    /// @param userOp The UserOperation to validate
+    /// @param maxCost Maximum gas cost to sponsor
+    /// @return validationData Validation result (0 for valid)
+    /// @return context Data to pass to postOp (sender, sponsorType)
+    function validatePaymasterUserOp(
+        UserOperation calldata userOp,
+        bytes32 /* userOpHash */,
+        uint256 maxCost
+    ) external view returns (uint256 validationData, bytes memory context) {
+        if (msg.sender != address(core)) revert SimplePaymaster__OnlyCoreAllowed();
+        if (!core.hasRole(core.PATIENT_ROLE(), userOp.sender)) revert SimplePaymaster__SenderNotPatient();
 
-// Post-operation hook
-function postOp(
-    uint8 mode,
-    bytes calldata context,
-    uint256 actualGasCost
-) external nonReentrant {
-    require(msg.sender == address(core), "Only TelemedicineCore can call");
-    if (mode != 0) return; // Only handle success (mode 0)
+        // Check gamification level
+        (bool success, bytes memory result) = address(core).staticcall(
+            abi.encodeWithSignature("getPatientLevel(address)", userOp.sender)
+        );
+        if (!success || abi.decode(result, (uint8)) == 0) revert SimplePaymaster__PatientLevelTooLow();
 
-    SponsorType sponsorType = abi.decode(context, (SponsorType));
-    address sender = tx.origin; // Simplified; in practice, extract from UserOperation via core
+        // Check subscription status
+        (bool isActive, , ) = subscription.getSubscriptionStatus(userOp.sender);
+        if (!isActive) revert SimplePaymaster__SubscriptionNotActive();
 
-    if (sponsorType == SponsorType.ETH) {
-        require(address(this).balance >= actualGasCost, "Insufficient ETH post-op");
-        // Gas cost is implicitly covered by ETH balance reduction
-    } else if (sponsorType == SponsorType.USDC) {
-        require(payments.usdcToken().balanceOf(address(this)) >= actualGasCost, "Insufficient USDC post-op");
-        require(payments.usdcToken().transfer(address(payments), actualGasCost), "USDC transfer failed");
-    } else if (sponsorType == SponsorType.SONIC) {
-        require(payments.sonicToken().balanceOf(address(this)) >= actualGasCost, "Insufficient SONIC post-op");
-        require(payments.sonicToken().transfer(address(payments), actualGasCost), "SONIC transfer failed");
-    } else {
-        revert("Unsupported sponsor type");
+        // Decode sponsor type
+        if (userOp.paymasterAndData.length < 21) revert SimplePaymaster__InvalidPaymasterData();
+        SponsorType sponsorType = SponsorType(uint8(userOp.paymasterAndData[20]));
+        _validateSponsorType(sponsorType);
+
+        // Validate funds
+        if (sponsorType == SponsorType.ETH) {
+            if (address(this).balance < maxCost) revert SimplePaymaster__InsufficientETHFunds();
+        } else if (sponsorType == SponsorType.USDC) {
+            if (payments.usdcToken().balanceOf(address(this)) < maxCost) revert SimplePaymaster__InsufficientUSDCFunds();
+        } else {
+            if (payments.sonicToken().balanceOf(address(this)) < maxCost) revert SimplePaymaster__InsufficientSONICFunds();
+        }
+
+        return (0, abi.encode(userOp.sender, sponsorType));
     }
 
-    sponsoredGasCosts[sender] = sponsoredGasCosts[sender].add(actualGasCost);
-    emit GasSponsored(sender, actualGasCost, sponsorType);
-}
+    /// @notice Handles post-operation gas cost accounting
+    /// @param mode PostOp mode (0 for success)
+    /// @param context Data from validatePaymasterUserOp (sender, sponsorType)
+    /// @param actualGasCost Actual gas cost incurred
+    function postOp(
+        uint8 mode,
+        bytes calldata context,
+        uint256 actualGasCost
+    ) external nonReentrant {
+        if (msg.sender != address(core)) revert SimplePaymaster__OnlyCoreAllowed();
+        if (mode != 0) return;
 
-// View balance for a specific sponsor type
-function getBalance(SponsorType _sponsorType) external view returns (uint256) {
-    if (_sponsorType == SponsorType.ETH) {
-        return address(this).balance;
-    } else if (_sponsorType == SponsorType.USDC) {
-        return payments.usdcToken().balanceOf(address(this));
-    } else if (_sponsorType == SponsorType.SONIC) {
+        (address sender, SponsorType sponsorType) = abi.decode(context, (address, SponsorType));
+        _validateSponsorType(sponsorType);
+
+        if (sponsorType == SponsorType.ETH) {
+            if (address(this).balance < actualGasCost) revert SimplePaymaster__InsufficientETHPostOp();
+        } else if (sponsorType == SponsorType.USDC) {
+            if (payments.usdcToken().balanceOf(address(this)) < actualGasCost) revert SimplePaymaster__InsufficientUSDCPostOp();
+            if (!payments.usdcToken().transfer(address(payments), actualGasCost)) revert SimplePaymaster__USDCTransferFailed();
+        } else {
+            if (payments.sonicToken().balanceOf(address(this)) < actualGasCost) revert SimplePaymaster__InsufficientSONICPostOp();
+            if (!payments.sonicToken().transfer(address(payments), actualGasCost)) revert SimplePaymaster__SONICTransferFailed();
+        }
+
+        sponsoredGasCosts[sender] += actualGasCost;
+        emit GasSponsored(sender, actualGasCost, sponsorType);
+    }
+
+    /// @notice Returns the balance for a sponsor type
+    /// @param _sponsorType Type of funds (ETH, USDC, SONIC)
+    /// @return Balance amount
+    function getBalance(SponsorType _sponsorType) external view returns (uint256) {
+        _validateSponsorType(_sponsorType);
+        if (_sponsorType == SponsorType.ETH) return address(this).balance;
+        if (_sponsorType == SponsorType.USDC) return payments.usdcToken().balanceOf(address(this));
         return payments.sonicToken().balanceOf(address(this));
-    } else {
-        revert("Unsupported sponsor type");
+    }
+
+    /// @notice Receives ETH deposits and emits an event
+    receive() external payable {
+        emit PaymasterFunded(msg.sender, msg.value, SponsorType.ETH);
+    }
+
+    /// @notice Restricts access to a specific role
+    modifier onlyRole(bytes32 role) {
+        if (!core.hasRole(role, msg.sender)) revert SimplePaymaster__Unauthorized();
+        _;
+    }
+
+    /// @notice Validates the sponsor type
+    /// @param _sponsorType Type to validate
+    function _validateSponsorType(SponsorType _sponsorType) private pure {
+        if (uint8(_sponsorType) > uint8(SponsorType.SONIC)) revert SimplePaymaster__InvalidSponsorType();
     }
 }
 
-// Fallback function to receive ETH
-receive() external payable {}
-
-// Role-based access modifier
-modifier onlyRole(bytes32 role) {
-    require(core.hasRole(role, msg.sender), "Unauthorized");
-    _;
-}
-
-}
+/// @notice Custom errors for SimplePaymaster
+error SimplePaymaster__InvalidCoreAddress();
+error SimplePaymaster__InvalidPaymentsAddress();
+error SimplePaymaster__InvalidSubscriptionAddress();
+error SimplePaymaster__InvalidDepositAmount();
+error SimplePaymaster__ETHAmountMismatch();
+error SimplePaymaster__NoETHForUSDCDdeposit();
+error SimplePaymaster__NoETHForSONICDeposit();
+error SimplePaymaster__USDCTransferFailed();
+error SimplePaymaster__SONICTransferFailed();
+error SimplePaymaster__InvalidRecipientAddress();
+error SimplePaymaster__InsufficientETHBalance();
+error SimplePaymaster__InsufficientUSDCBalance();
+error SimplePaymaster__InsufficientSONICBalance();
+error SimplePaymaster__ETHWithdrawalFailed();
+error SimplePaymaster__USDCWithdrawalFailed();
+error SimplePaymaster__SONICWithdrawalFailed();
+error SimplePaymaster__OnlyCoreAllowed();
+error SimplePaymaster__SenderNotPatient();
+error SimplePaymaster__PatientLevelTooLow();
+error SimplePaymaster__SubscriptionNotActive();
+error SimplePaymaster__InvalidPaymasterData();
+error SimplePaymaster__InsufficientETHFunds();
+error SimplePaymaster__InsufficientUSDCFunds();
+error SimplePaymaster__InsufficientSONICFunds();
+error SimplePaymaster__InsufficientETHPostOp();
+error SimplePaymaster__InsufficientUSDCPostOp();
+error SimplePaymaster__InsufficientSONICPostOp();
+error SimplePaymaster__Unauthorized();
+error SimplePaymaster__InvalidSponsorType();
