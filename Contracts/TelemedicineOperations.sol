@@ -13,8 +13,8 @@ import {ChainlinkClient, Chainlink} from "@chainlink/contracts/src/v0.8/Chainlin
 import "./TelemedicineCore.sol";
 
 /// @title TelemedicineOperations
-/// @notice Manages appointments, lab tests, prescriptions, AI analyses, payment queues, and provider invitations
-/// @dev UUPS upgradeable, integrates with Chainlink, and uses SafeERC20 for token transfers
+/// @notice Manages appointments, lab tests, prescriptions, AI symptom analyses, payment queues, and provider invitations
+/// @dev UUPS upgradeable, integrates with Chainlink for pricing and AI services, uses SafeERC20 for token transfers
 contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, ChainlinkClient {
     using SafeMathUpgradeable for uint256;
     using AddressUpgradeable for address payable;
@@ -45,16 +45,23 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     error ChainlinkRequestTimeout();
     error ExternalCallFailed();
     error InvalidNonce();
+    error InvalidSymptoms();
+    error AnalysisNotPending();
+    error AlreadyReviewed();
 
     // Constants
     uint256 public constant RESERVE_FUND_THRESHOLD = 1 ether;
-    uint256 public constant MIN_IPFS_HASH_LENGTH = 46; // New: Standard IPFS hash length
-    uint48 public constant CHAINLINK_TIMEOUT = 1 hours; // New: Chainlink request timeout
-    uint256 public constant MAX_DOCTORS_PER_APPOINTMENT = 5; // New: Limit doctors per appointment
+    uint256 public constant MIN_IPFS_HASH_LENGTH = 46;
+    uint48 public constant CHAINLINK_TIMEOUT = 1 hours;
+    uint256 public constant MAX_DOCTORS_PER_APPOINTMENT = 5;
+    uint256 public constant MIN_SYMPTOMS_LENGTH = 10;
+    uint256 public constant MAX_SYMPTOMS_LENGTH = 1000;
+    uint256 public constant AI_ANALYSIS_FEE = 10 * 10**6; // 10 USDC (6 decimals)
 
     // Configurable Parameters
-    uint256 public maxPendingAppointments; // New: Configurable instead of hardcoded
-    uint48 public chainlinkTimeout; // New: Configurable Chainlink timeout
+    uint256 public maxPendingAppointments;
+    uint48 public chainlinkTimeout;
+    uint256 public aiAnalysisFee; // AI analysis fee in USDC (6 decimals)
 
     // State Variables
     mapping(uint256 => Appointment) public appointments;
@@ -68,11 +75,17 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     mapping(uint256 => uint48) public labTestPaymentDeadlines;
     mapping(uint256 => bool) public prescriptionPayments;
     mapping(uint256 => uint48) public prescriptionPaymentDeadlines;
+    mapping(bytes32 => uint256) public requestToLabTestId;
+    mapping(bytes32 => uint256) public requestToPrescriptionId;
+    mapping(bytes32 => uint256) public requestToAnalysisId;
+    mapping(bytes32 => uint48) public requestTimestamps;
     uint256 public appointmentCounter;
     uint256 public labTestCounter;
     uint256 public prescriptionCounter;
     uint256 public aiAnalysisCounter;
-    uint256 public versionNumber; // New: Track contract version
+    uint256 public versionNumber;
+    uint256 public pendingPaymentCounter;
+    uint256 public invitationCounter;
 
     // Payment Queue
     struct PendingPayment {
@@ -82,24 +95,17 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         bool processed;
     }
     mapping(uint256 => PendingPayment) public pendingPayments;
-    uint256 public pendingPaymentCounter;
 
     // Invitation Mechanism
     struct Invitation {
         address patient;
         string locality;
-        bytes32 inviteeContactHash; // Updated: Store hash
+        bytes32 inviteeContactHash;
         bool isLabTech;
         bool fulfilled;
         uint48 expirationTimestamp;
     }
     mapping(bytes32 => Invitation) public invitations;
-    uint256 public invitationCounter;
-
-    // Chainlink Configuration
-    mapping(bytes32 => uint256) public requestToLabTestId;
-    mapping(bytes32 => uint256) public requestToPrescriptionId;
-    mapping(bytes32 => uint48) public requestTimestamps;
 
     // Structs
     struct Appointment {
@@ -112,7 +118,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         TelemedicinePayments.PaymentType paymentType;
         bool isVideoCall;
         bool isPriority;
-        bytes32 videoCallLinkHash; // Updated: Store hash
+        bytes32 videoCallLinkHash;
         uint48 disputeWindowEnd;
         DisputeOutcome disputeOutcome;
     }
@@ -155,14 +161,20 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     struct AISymptomAnalysis {
         uint256 id;
         address patient;
-        bool doctorReviewed;
+        address doctor;
+        AISymptomStatus status;
         string symptoms;
         string analysisIpfsHash;
+        uint256 cost;
+        uint48 requestTimestamp;
+        uint48 disputeWindowEnd;
+        DisputeOutcome disputeOutcome;
+        TelemedicinePayments.PaymentType paymentType;
     }
 
     struct PendingAppointments {
-        uint256[] ids; // Updated: Simplified to array
-        mapping(uint256 => uint256) indices; // New: Track indices for removal
+        uint256[] ids;
+        mapping(uint256 => uint256) indices;
     }
 
     struct Reminder {
@@ -176,6 +188,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     enum LabTestStatus { Requested, PaymentPending, Collected, ResultsUploaded, Reviewed, Disputed, Expired }
     enum PrescriptionStatus { Generated, PaymentPending, Verified, Fulfilled, Revoked, Expired, Disputed }
     enum DisputeOutcome { Unresolved, PatientFavored, ProviderFavored, MutualAgreement }
+    enum AISymptomStatus { Requested, Pending, Completed, Reviewed, Cancelled, Disputed }
 
     // External Contracts
     TelemedicineCore public core;
@@ -204,8 +217,13 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     event PrescriptionPaymentConfirmed(uint256 indexed prescriptionId, uint256 amount);
     event PaymentQueued(uint256 indexed paymentId, address recipient, uint256 amount, TelemedicinePayments.PaymentType paymentType);
     event PaymentReleasedFromQueue(uint256 indexed paymentId, address recipient, uint256 amount);
-    event MaxPendingAppointmentsUpdated(uint256 newMax); // New: Configurable max
-    event ChainlinkTimeoutUpdated(uint48 newTimeout); // New: Configurable timeout
+    event MaxPendingAppointmentsUpdated(uint256 newMax);
+    event ChainlinkTimeoutUpdated(uint48 newTimeout);
+    event AISymptomAnalysisRequested(uint256 indexed analysisId, address patient, string symptoms, uint48 requestedAt);
+    event AISymptomAnalysisFulfilled(uint256 indexed analysisId, string analysisIpfsHash);
+    event AISymptomAnalysisReviewed(uint256 indexed analysisId, address doctor);
+    event AISymptomAnalysisCancelled(uint256 indexed analysisId);
+    event AIAnalysisFeeUpdated(uint256 newFee);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -241,12 +259,14 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         aiAnalysisCounter = 0;
         invitationCounter = 0;
         pendingPaymentCounter = 0;
-        maxPendingAppointments = 100; // New: Configurable default
-        chainlinkTimeout = CHAINLINK_TIMEOUT; // New: Configurable default
+        maxPendingAppointments = 100;
+        chainlinkTimeout = CHAINLINK_TIMEOUT;
+        aiAnalysisFee = AI_ANALYSIS_FEE;
         versionNumber = 1;
 
         emit MaxPendingAppointmentsUpdated(100);
         emit ChainlinkTimeoutUpdated(CHAINLINK_TIMEOUT);
+        emit AIAnalysisFeeUpdated(AI_ANALYSIS_FEE);
     }
 
     /// @notice Authorizes contract upgrades (admin only)
@@ -268,6 +288,14 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         if (_newTimeout < 30 minutes) revert InvalidTimestamp();
         chainlinkTimeout = _newTimeout;
         emit ChainlinkTimeoutUpdated(_newTimeout);
+    }
+
+    /// @notice Updates AI analysis fee (admin only)
+    /// @param _newFee New fee in USDC (6 decimals, minimum 1 USDC)
+    function updateAIAnalysisFee(uint256 _newFee) external onlyRole(core.ADMIN_ROLE()) {
+        if (_newFee < 1 * 10**6) revert InsufficientFunds();
+        aiAnalysisFee = _newFee;
+        emit AIAnalysisFeeUpdated(_newFee);
     }
 
     // Appointment Functions
@@ -339,7 +367,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
                 _safeTransferETH(msg.sender, msg.value.sub(discountedFee));
             }
         } else {
-            // Updated: Try-catch for payment processing
             try payments._processPayment(_paymentType, discountedFee) {
                 if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
                     payments.usdcToken().safeTransferFrom(address(payments), address(this), reserveAmount);
@@ -394,7 +421,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         external onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused onlyMultiSig(_operationHash)
     {
         if (bytes(_ipfsSummary).length < MIN_IPFS_HASH_LENGTH) revert InvalidIpfsHash();
-        // Updated: Validate nonce
         uint256 currentNonce = nonces[msg.sender];
         bytes32 expectedHash = keccak256(abi.encodePacked(
             "completeAppointment",
@@ -419,7 +445,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         if (apt.status != AppointmentStatus.Confirmed) revert InvalidStatus();
         if (_appointmentId == 0 || _appointmentId > appointmentCounter) revert InvalidIndex();
 
-        // Updated: Try-catch for dispute resolution
         DisputeOutcome outcome = DisputeOutcome.Unresolved;
         try disputeResolution.isDisputed(_appointmentId) returns (bool isDisputed) {
             if (isDisputed) {
@@ -458,8 +483,8 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _patient Patient address
     /// @param _testTypeIpfsHash IPFS hash of the test type
     /// @param _locality Locality for lab tech selection
-    function orderLabTest(address _patient, string calldata _testTypeIpfsHash, string calldata _locality) 
-        external payable onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused 
+    function orderLabTest(address _patient, string calldata _testTypeIpfsHash, string calldata _locality)
+        external payable onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused
     {
         if (_patient == address(0) || !core.patients(_patient).isRegistered) revert InvalidAddress();
         if (bytes(_testTypeIpfsHash).length < MIN_IPFS_HASH_LENGTH || bytes(_locality).length == 0) revert InvalidIpfsHash();
@@ -467,7 +492,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         address selectedLabTech = selectBestLabTech(_testTypeIpfsHash, _locality);
         if (selectedLabTech == address(0)) revert NoLabTechAvailable();
 
-        // Updated: Validate deadlines
         (uint256 price, bool isValid, uint48 sampleDeadline, uint48 resultsDeadline) = services.getLabTestDetails(selectedLabTech, _testTypeIpfsHash);
         if (sampleDeadline < block.timestamp + 1 hours || resultsDeadline < sampleDeadline + 1 hours) revert InvalidTimestamp();
 
@@ -486,7 +510,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
             sampleCollectionIpfsHash: "",
             resultsIpfsHash: "",
             patientCost: 0,
-            disputeWindowEnd: uint48(block.timestamp).add(core.disputeWindow()), // Updated: Set initially
+            disputeWindowEnd: uint48(block.timestamp).add(core.disputeWindow()),
             disputeOutcome: DisputeOutcome.Unresolved,
             sampleCollectionDeadline: sampleDeadline,
             resultsUploadDeadline: resultsDeadline,
@@ -506,7 +530,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         }
 
         emit LabTestOrdered(newTestId, _patient, msg.sender, _testTypeIpfsHash, uint48(block.timestamp));
-        // Updated: Try-catch for monetizeData
         try services.monetizeData(_patient) {
             // Success
         } catch {
@@ -519,10 +542,8 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _testTypeIpfsHash IPFS hash of the test type
     /// @param _labTestId Lab test ID
     function requestLabTestPrice(address _labTech, string calldata _testTypeIpfsHash, uint256 _labTestId) internal returns (bytes32) {
-        // Updated: Clarify manualPriceOverride
         if (core.manualPriceOverride()) {
-            // Fallback to default price (set by admin off-chain)
-            labTestOrders[_labTestId].patientCost = 0.01 ether; // Example default
+            labTestOrders[_labTestId].patientCost = 0.01 ether;
             labTestOrders[_labTestId].status = LabTestStatus.PaymentPending;
             labTestPaymentDeadlines[_labTestId] = uint48(block.timestamp).add(core.paymentConfirmationDeadline());
             emit LabTestPaymentConfirmed(_labTestId, labTestOrders[_labTestId].patientCost);
@@ -541,7 +562,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _requestId Chainlink request ID
     /// @param _price Returned price
     function fulfillLabTestPrice(bytes32 _requestId, uint256 _price) public recordChainlinkFulfillment(_requestId) {
-        // Updated: Check timeout
         if (block.timestamp > requestTimestamps[_requestId] + chainlinkTimeout) revert ChainlinkRequestTimeout();
 
         uint256 labTestId = requestToLabTestId[_requestId];
@@ -549,8 +569,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         LabTestOrder storage order = labTestOrders[labTestId];
         if (order.status != LabTestStatus.Requested) revert InvalidStatus();
         if (_price == 0) {
-            // Fallback to default price
-            order.patientCost = 0.01 ether; // Example default
+            order.patientCost = 0.01 ether;
         } else {
             order.patientCost = _price.mul(120).div(core.PERCENTAGE_DENOMINATOR());
         }
@@ -569,8 +588,8 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _medicationIpfsHash IPFS hash of the medication
     /// @param _pharmacy Pharmacy address
     /// @param _locality Locality for pharmacy selection
-    function issuePrescription(address _patient, string calldata _medicationIpfsHash, address _pharmacy, string calldata _locality) 
-        external payable onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused 
+    function issuePrescription(address _patient, string calldata _medicationIpfsHash, address _pharmacy, string calldata _locality)
+        external payable onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused
     {
         if (_patient == address(0) || !core.patients(_patient).isRegistered || _pharmacy == address(0)) revert InvalidAddress();
         if (!services.isPharmacyRegistered(_pharmacy) && !services.hasPharmacyInLocality(_locality)) revert NotAuthorized();
@@ -593,7 +612,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
             medicationIpfsHash: _medicationIpfsHash,
             prescriptionIpfsHash: "",
             patientCost: 0,
-            disputeWindowEnd: uint48(block.timestamp).add(core.disputeWindow()), // Updated: Set initially
+            disputeWindowEnd: uint48(block.timestamp).add(core.disputeWindow()),
             disputeOutcome: DisputeOutcome.Unresolved
         });
 
@@ -623,7 +642,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _prescriptionId Prescription ID
     function requestPrescriptionPrice(address _pharmacy, string calldata _medicationIpfsHash, uint256 _prescriptionId) internal returns (bytes32) {
         if (core.manualPriceOverride()) {
-            prescriptions[_prescriptionId].patientCost = 0.005 ether; // Example default
+            prescriptions[_prescriptionId].patientCost = 0.005 ether;
             prescriptions[_prescriptionId].status = PrescriptionStatus.PaymentPending;
             prescriptionPaymentDeadlines[_prescriptionId] = uint48(block.timestamp).add(core.paymentConfirmationDeadline());
             emit PrescriptionPaymentConfirmed(_prescriptionId, prescriptions[_prescriptionId].patientCost);
@@ -649,7 +668,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         Prescription storage prescription = prescriptions[prescriptionId];
         if (prescription.status != PrescriptionStatus.Generated) revert InvalidStatus();
         if (_price == 0) {
-            prescription.patientCost = 0.005 ether; // Example default
+            prescription.patientCost = 0.005 ether;
         } else {
             prescription.patientCost = _price.mul(120).div(core.PERCENTAGE_DENOMINATOR());
         }
@@ -661,14 +680,199 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         emit PrescriptionPaymentConfirmed(prescriptionId, prescription.patientCost);
     }
 
+    // AI Symptom Analysis Functions
+
+    /// @notice Requests an AI symptom analysis
+    /// @param _symptoms Description of patient symptoms
+    /// @param _paymentType Payment type (ETH, USDC, SONIC)
+    function requestAISymptomAnalysis(string calldata _symptoms, TelemedicinePayments.PaymentType _paymentType)
+        external payable onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused
+    {
+        if (bytes(_symptoms).length < MIN_SYMPTOMS_LENGTH || bytes(_symptoms).length > MAX_SYMPTOMS_LENGTH) revert InvalidSymptoms();
+
+        aiAnalysisCounter = aiAnalysisCounter.add(1);
+        uint256 newAnalysisId = aiAnalysisCounter;
+
+        aiAnalyses[newAnalysisId] = AISymptomAnalysis({
+            id: newAnalysisId,
+            patient: msg.sender,
+            doctor: address(0),
+            status: AISymptomStatus.Requested,
+            symptoms: _symptoms,
+            analysisIpfsHash: "",
+            cost: aiAnalysisFee,
+            requestTimestamp: uint48(block.timestamp),
+            disputeWindowEnd: 0,
+            disputeOutcome: DisputeOutcome.Unresolved,
+            paymentType: _paymentType
+        });
+
+        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+            if (msg.value < aiAnalysisFee) revert InsufficientFunds();
+            uint256 reserveAmount = aiAnalysisFee.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
+            core.reserveFund = core.reserveFund.add(reserveAmount);
+            emit ReserveFundAllocated(newAnalysisId, reserveAmount, _paymentType);
+            if (msg.value > aiAnalysisFee) {
+                _safeTransferETH(msg.sender, msg.value.sub(aiAnalysisFee));
+            }
+        } else {
+            try payments._processPayment(_paymentType, aiAnalysisFee) {
+                uint256 reserveAmount = aiAnalysisFee.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
+                if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+                    payments.usdcToken().safeTransferFrom(address(payments), address(this), reserveAmount);
+                    core.reserveFund = core.reserveFund.add(reserveAmount);
+                } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
+                    payments.sonicToken().safeTransferFrom(address(payments), address(this), reserveAmount);
+                    core.reserveFund = core.reserveFund.add(reserveAmount);
+                }
+                emit ReserveFundAllocated(newAnalysisId, reserveAmount, _paymentType);
+            } catch {
+                revert ExternalCallFailed();
+            }
+        }
+
+        bytes32 requestId = requestAIAnalysis(_symptoms, newAnalysisId);
+        aiAnalyses[newAnalysisId].status = AISymptomStatus.Pending;
+        requestToAnalysisId[requestId] = newAnalysisId;
+
+        emit AISymptomAnalysisRequested(newAnalysisId, msg.sender, _symptoms, uint48(block.timestamp));
+    }
+
+    /// @notice Requests AI analysis from an external service via Chainlink
+    /// @param _symptoms Symptoms to analyze
+    /// @param _analysisId Analysis ID
+    /// @return Chainlink request ID
+    function requestAIAnalysis(string memory _symptoms, uint256 _analysisId) internal returns (bytes32) {
+        if (core.manualPriceOverride()) {
+            aiAnalyses[_analysisId].analysisIpfsHash = "QmMockAnalysisHash";
+            aiAnalyses[_analysisId].status = AISymptomStatus.Completed;
+            aiAnalyses[_analysisId].disputeWindowEnd = uint48(block.timestamp).add(core.disputeWindow());
+            emit AISymptomAnalysisFulfilled(_analysisId, aiAnalyses[_analysisId].analysisIpfsHash);
+            return bytes32(0);
+        }
+
+        Chainlink.Request memory req = buildChainlinkRequest(
+            core.aiAnalysisJobId(),
+            address(this),
+            this.fulfillAISymptomAnalysis.selector
+        );
+        req.add("symptoms", _symptoms);
+        req.add("analysisId", toString(_analysisId));
+        bytes32 requestId = sendChainlinkRequestTo(core.chainlinkOracle(), req, core.chainlinkFee());
+        requestTimestamps[requestId] = uint48(block.timestamp);
+        return requestId;
+    }
+
+    /// @notice Handles Chainlink AI analysis response
+    /// @param _requestId Chainlink request ID
+    /// @param _analysisIpfsHash IPFS hash of the AI analysis
+    function fulfillAISymptomAnalysis(bytes32 _requestId, string calldata _analysisIpfsHash)
+        public recordChainlinkFulfillment(_requestId)
+    {
+        if (block.timestamp > requestTimestamps[_requestId] + chainlinkTimeout) revert ChainlinkRequestTimeout();
+        if (bytes(_analysisIpfsHash).length < MIN_IPFS_HASH_LENGTH) revert InvalidIpfsHash();
+
+        uint256 analysisId = requestToAnalysisId[_requestId];
+        if (analysisId == 0 || analysisId > aiAnalysisCounter) revert InvalidIndex();
+        AISymptomAnalysis storage analysis = aiAnalyses[analysisId];
+        if (analysis.status != AISymptomStatus.Pending) revert AnalysisNotPending();
+
+        analysis.analysisIpfsHash = _analysisIpfsHash;
+        analysis.status = AISymptomStatus.Completed;
+        analysis.disputeWindowEnd = uint48(block.timestamp).add(core.disputeWindow());
+
+        delete requestToAnalysisId[_requestId];
+        delete requestTimestamps[_requestId];
+        emit AISymptomAnalysisFulfilled(analysisId, _analysisIpfsHash);
+
+        try services.monetizeData(analysis.patient) {
+            // Success
+        } catch {
+            // Log failure but don't revert
+        }
+    }
+
+    /// @notice Allows a doctor to review an AI symptom analysis
+    /// @param _analysisId Analysis ID
+    /// @param _operationHash Multi-sig operation hash
+    function reviewAISymptomAnalysis(uint256 _analysisId, bytes32 _operationHash)
+        external onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused onlyMultiSig(_operationHash)
+    {
+        AISymptomAnalysis storage analysis = aiAnalyses[_analysisId];
+        if (_analysisId == 0 || _analysisId > aiAnalysisCounter) revert InvalidIndex();
+        if (analysis.status != AISymptomStatus.Completed) revert InvalidStatus();
+        if (analysis.doctor != address(0)) revert AlreadyReviewed();
+        if (block.timestamp > analysis.disputeWindowEnd) revert DeadlineMissed();
+
+        uint256 currentNonce = nonces[msg.sender];
+        bytes32 expectedHash = keccak256(abi.encodePacked(
+            "reviewAISymptomAnalysis",
+            _analysisId,
+            msg.sender,
+            block.timestamp,
+            currentNonce
+        ));
+        if (_operationHash != expectedHash) revert MultiSigNotApproved();
+        nonces[msg.sender] = currentNonce.add(1);
+
+        DisputeOutcome outcome = DisputeOutcome.Unresolved;
+        try disputeResolution.isDisputed(_analysisId) returns (bool isDisputed) {
+            if (isDisputed) {
+                outcome = disputeResolution.getDisputeOutcome(_analysisId);
+                if (outcome == DisputeOutcome.Unresolved) revert InvalidStatus();
+                analysis.disputeOutcome = outcome;
+            }
+        } catch {
+            revert ExternalCallFailed();
+        }
+
+        analysis.doctor = msg.sender;
+        analysis.status = AISymptomStatus.Reviewed;
+
+        uint256 reviewFee = aiAnalysisFee.mul(core.doctorFeePercentage()).div(core.PERCENTAGE_DENOMINATOR());
+        _releasePayment(msg.sender, reviewFee, analysis.paymentType);
+        emit DoctorPaid(_analysisId, msg.sender, reviewFee, analysis.paymentType);
+
+        if (outcome != DisputeOutcome.Unresolved) {
+            try services.notifyDisputeResolved(_analysisId, "AISymptomAnalysis", outcome) {
+                // Success
+            } catch {
+                revert ExternalCallFailed();
+            }
+        }
+
+        emit AISymptomAnalysisReviewed(_analysisId, msg.sender);
+    }
+
+    /// @notice Cancels a pending AI symptom analysis
+    /// @param _analysisId Analysis ID
+    function cancelAISymptomAnalysis(uint256 _analysisId)
+        external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused
+    {
+        AISymptomAnalysis storage analysis = aiAnalyses[_analysisId];
+        if (_analysisId == 0 || _analysisId > aiAnalysisCounter) revert InvalidIndex();
+        if (analysis.patient != msg.sender) revert NotAuthorized();
+        if (analysis.status != AISymptomStatus.Requested && analysis.status != AISymptomStatus.Pending) revert InvalidStatus();
+
+        analysis.status = AISymptomStatus.Cancelled;
+
+        try payments._refundPatient(msg.sender, analysis.cost, analysis.paymentType) {
+            // Success
+        } catch {
+            revert ExternalCallFailed();
+        }
+
+        emit AISymptomAnalysisCancelled(_analysisId);
+    }
+
     // Invitation Functions
 
     /// @notice Invites a provider to a locality
     /// @param _locality Locality name
     /// @param _inviteeContactHash Hash of invitee contact info
     /// @param _isLabTech Whether the invitee is a lab technician
-    function inviteProvider(string calldata _locality, bytes32 _inviteeContactHash, bool _isLabTech) 
-        external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused 
+    function inviteProvider(string calldata _locality, bytes32 _inviteeContactHash, bool _isLabTech)
+        external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused
     {
         if (bytes(_locality).length == 0 || _inviteeContactHash == bytes32(0)) revert InvalidLocality();
 
@@ -694,8 +898,8 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @notice Registers an invited provider
     /// @param _invitationId Invitation ID
     /// @param _providerAddress Provider address
-    function registerAsInvitedProvider(bytes32 _invitationId, address _providerAddress) 
-        external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused 
+    function registerAsInvitedProvider(bytes32 _invitationId, address _providerAddress)
+        external onlyRole(core.ADMIN_ROLE()) nonReentrant whenNotPaused
     {
         Invitation storage invitation = invitations[_invitationId];
         if (invitation.patient == address(0)) revert InvalidIndex();
@@ -703,10 +907,9 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         if (block.timestamp > invitation.expirationTimestamp) revert InvitationExpired();
         if (_providerAddress == address(0)) revert InvalidAddress();
 
-        // Updated: Try-catch for registration
-        try invitation.isLabTech ? 
-            services.registerLabTech(_providerAddress, invitation.locality) : 
-            services.registerPharmacy(_providerAddress, invitation.locality) 
+        try invitation.isLabTech ?
+            services.registerLabTech(_providerAddress, invitation.locality) :
+            services.registerPharmacy(_providerAddress, invitation.locality)
         {
             invitation.fulfilled = true;
             emit InvitationFulfilled(_invitationId, _providerAddress);
@@ -789,7 +992,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         uint256 highestScore = 0;
         address fallbackTech = address(0);
 
-        // Updated: Limit loop to maxBatchSize
         uint256 maxIterations = labTechs.length > core.maxBatchSize() ? core.maxBatchSize() : labTechs.length;
         for (uint256 i = 0; i < maxIterations; i++) {
             if (!services.isLabTechRegistered(labTechs[i])) continue;
@@ -814,7 +1016,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _to Recipient address
     /// @param _amount Amount to transfer
     function _safeTransferETH(address _to, uint256 _amount) internal {
-        // Updated: Gas-limited call
         (bool success, ) = _to.call{value: _amount, gas: 30000}("");
         if (!success) revert PaymentFailed();
     }
@@ -871,6 +1072,26 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         return string(str);
     }
 
+    /// @notice Converts uint256 to string for Chainlink requests
+    /// @param _value Value to convert
+    /// @return String representation
+    function toString(uint256 _value) internal pure returns (string memory) {
+        if (_value == 0) return "0";
+        uint256 temp = _value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (_value != 0) {
+            digits--;
+            buffer[digits] = bytes1(uint8(48 + (_value % 10)));
+            _value /= 10;
+        }
+        return string(buffer);
+    }
+
     // Modifiers
 
     /// @notice Restricts access to a specific role
@@ -896,6 +1117,6 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     // Fallback
     receive() external payable {}
 
-    // New: Storage gap for future upgrades
+    // Storage gap for future upgrades
     uint256[50] private __gap;
 }
