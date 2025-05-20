@@ -79,6 +79,9 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     mapping(bytes32 => uint256) public requestToPrescriptionId;
     mapping(bytes32 => uint256) public requestToAnalysisId;
     mapping(bytes32 => uint48) public requestTimestamps;
+    mapping(uint256 => uint256) public appointmentToDisputeIds;
+    mapping(uint256 => uint256) public labTestToDisputeIds;
+    mapping(uint256 => uint256) public aiAnalysisToDisputeIds;
     uint256 public appointmentCounter;
     uint256 public labTestCounter;
     uint256 public prescriptionCounter;
@@ -319,6 +322,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         }
         if (_timestamp <= block.timestamp + core.minBookingBuffer()) revert InvalidTimestamp();
         if (_isVideoCall && _videoCallLinkHash == bytes32(0)) revert InvalidIpfsHash();
+        if (disputeResolution.isDisputed(appointmentCounter + 1)) revert InvalidStatus(); // Check for disputes
 
         core.decayPoints(msg.sender);
         uint256 baseFee = 0;
@@ -360,7 +364,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
 
         if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
             if (msg.value < discountedFee) revert InsufficientFunds();
-            core.reserveFund = core.reserveFund.add(reserveAmount);
+            core.reserveFundETH = core.reserveFundETH.add(reserveAmount);
             emit ReserveFundAllocated(newAppointmentId, reserveAmount, _paymentType);
             emit PlatformFeeAllocated(newAppointmentId, platformAmount, _paymentType);
             if (msg.value > discountedFee) {
@@ -370,10 +374,10 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
             try payments._processPayment(_paymentType, discountedFee) {
                 if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
                     payments.usdcToken().safeTransferFrom(address(payments), address(this), reserveAmount);
-                    core.reserveFund = core.reserveFund.add(reserveAmount);
+                    core.reserveFundUSDC = core.reserveFundUSDC.add(reserveAmount);
                 } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
                     payments.sonicToken().safeTransferFrom(address(payments), address(this), reserveAmount);
-                    core.reserveFund = core.reserveFund.add(reserveAmount);
+                    core.reserveFundSONIC = core.reserveFundSONIC.add(reserveAmount);
                 }
                 emit ReserveFundAllocated(newAppointmentId, reserveAmount, _paymentType);
                 emit PlatformFeeAllocated(newAppointmentId, platformAmount, _paymentType);
@@ -446,6 +450,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         if (_appointmentId == 0 || _appointmentId > appointmentCounter) revert InvalidIndex();
 
         DisputeOutcome outcome = DisputeOutcome.Unresolved;
+        uint256 disputeId = appointmentToDisputeIds[_appointmentId];
         try disputeResolution.isDisputed(_appointmentId) returns (bool isDisputed) {
             if (isDisputed) {
                 outcome = disputeResolution.getDisputeOutcome(_appointmentId);
@@ -467,7 +472,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         }
 
         if (apt.disputeOutcome != DisputeOutcome.Unresolved) {
-            try services.notifyDisputeResolved(_appointmentId, "Appointment", apt.disputeOutcome) {
+            try services.notifyDisputeResolved(_appointmentId, "Appointment", apt.disputeOutcome, disputeId) {
                 // Success
             } catch {
                 revert ExternalCallFailed();
@@ -488,6 +493,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     {
         if (_patient == address(0) || !core.patients(_patient).isRegistered) revert InvalidAddress();
         if (bytes(_testTypeIpfsHash).length < MIN_IPFS_HASH_LENGTH || bytes(_locality).length == 0) revert InvalidIpfsHash();
+        if (disputeResolution.isDisputed(labTestCounter + 1)) revert InvalidStatus();
 
         address selectedLabTech = selectBestLabTech(_testTypeIpfsHash, _locality);
         if (selectedLabTech == address(0)) revert NoLabTechAvailable();
@@ -594,6 +600,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         if (_patient == address(0) || !core.patients(_patient).isRegistered || _pharmacy == address(0)) revert InvalidAddress();
         if (!services.isPharmacyRegistered(_pharmacy) && !services.hasPharmacyInLocality(_locality)) revert NotAuthorized();
         if (bytes(_medicationIpfsHash).length < MIN_IPFS_HASH_LENGTH || bytes(_locality).length == 0) revert InvalidIpfsHash();
+        if (disputeResolution.isDisputed(prescriptionCounter + 1)) revert InvalidStatus();
 
         (uint256 price, bool isValid) = services.getPharmacyPrice(_pharmacy, _medicationIpfsHash);
         prescriptionCounter = prescriptionCounter.add(1);
@@ -689,6 +696,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         external payable onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused
     {
         if (bytes(_symptoms).length < MIN_SYMPTOMS_LENGTH || bytes(_symptoms).length > MAX_SYMPTOMS_LENGTH) revert InvalidSymptoms();
+        if (disputeResolution.isDisputed(aiAnalysisCounter + 1)) revert InvalidStatus();
 
         aiAnalysisCounter = aiAnalysisCounter.add(1);
         uint256 newAnalysisId = aiAnalysisCounter;
@@ -710,7 +718,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
             if (msg.value < aiAnalysisFee) revert InsufficientFunds();
             uint256 reserveAmount = aiAnalysisFee.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
-            core.reserveFund = core.reserveFund.add(reserveAmount);
+            core.reserveFundETH = core.reserveFundETH.add(reserveAmount);
             emit ReserveFundAllocated(newAnalysisId, reserveAmount, _paymentType);
             if (msg.value > aiAnalysisFee) {
                 _safeTransferETH(msg.sender, msg.value.sub(aiAnalysisFee));
@@ -720,10 +728,10 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
                 uint256 reserveAmount = aiAnalysisFee.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
                 if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
                     payments.usdcToken().safeTransferFrom(address(payments), address(this), reserveAmount);
-                    core.reserveFund = core.reserveFund.add(reserveAmount);
+                    core.reserveFundUSDC = core.reserveFundUSDC.add(reserveAmount);
                 } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
                     payments.sonicToken().safeTransferFrom(address(payments), address(this), reserveAmount);
-                    core.reserveFund = core.reserveFund.add(reserveAmount);
+                    core.reserveFundSONIC = core.reserveFundSONIC.add(reserveAmount);
                 }
                 emit ReserveFundAllocated(newAnalysisId, reserveAmount, _paymentType);
             } catch {
@@ -816,6 +824,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         nonces[msg.sender] = currentNonce.add(1);
 
         DisputeOutcome outcome = DisputeOutcome.Unresolved;
+        uint256 disputeId = aiAnalysisToDisputeIds[_analysisId];
         try disputeResolution.isDisputed(_analysisId) returns (bool isDisputed) {
             if (isDisputed) {
                 outcome = disputeResolution.getDisputeOutcome(_analysisId);
@@ -834,7 +843,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         emit DoctorPaid(_analysisId, msg.sender, reviewFee, analysis.paymentType);
 
         if (outcome != DisputeOutcome.Unresolved) {
-            try services.notifyDisputeResolved(_analysisId, "AISymptomAnalysis", outcome) {
+            try services.notifyDisputeResolved(_analysisId, "AISymptomAnalysis", outcome, disputeId) {
                 // Success
             } catch {
                 revert ExternalCallFailed();
