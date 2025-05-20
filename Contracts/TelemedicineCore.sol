@@ -19,7 +19,7 @@ interface IERC20Upgradeable {
 /// @notice Handles payment processing and refunds in ETH, USDC, or SONIC tokens
 interface TelemedicinePayments {
     enum PaymentType { ETH, USDC, SONIC }
-    function _processPayment(PaymentType paymentType, uint256 amount) external;
+    function _processPayment(PaymentType paymentType, uint256 amount) external payable;
     function _refundPatient(address patient, uint256 amount, PaymentType paymentType) external;
     function usdcToken() external view returns (IERC20Upgradeable);
     function sonicToken() external view returns (IERC20Upgradeable);
@@ -37,8 +37,8 @@ interface TelemedicineDisputeResolution {
 interface TelemedicineMedicalServices {
     function hasLabTechInLocality(string calldata locality) external view returns (bool);
     function hasPharmacyInLocality(string calldata locality) external view returns (bool);
-    function registerLabTech(address labTech, string calldata locality) external;
-    function registerPharmacy(address pharmacy, string calldata locality) external;
+    function registerLabTech(address labTech) external;
+    function registerPharmacy(address pharmacy) external;
     function isLabTechRegistered(address labTech) external view returns (bool);
     function isPharmacyRegistered(address pharmacy) external view returns (bool);
     function getLabTechsInLocality(string calldata locality, uint256 page, uint256 pageSize) external view returns (address[] memory, uint256);
@@ -196,6 +196,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     event DisputeResolutionUpdated(address indexed oldAddress, address indexed newAddress);
     event ConfigurationUpdated(ConfigParameter parameter, uint256 value);
     event ChainlinkPriceReceived(bytes32 requestId, uint256 price);
+    event ReserveFundUpdated(TelemedicinePayments.PaymentType paymentType, uint256 newBalance);
 
     // Custom Errors
     error TelemedicineCore__InvalidAddress();
@@ -210,6 +211,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     error TelemedicineCore__InvalidMultiSigConfig();
     error TelemedicineCore__InvalidParameterValue();
     error TelemedicineCore__InsufficientLinkBalance();
+    error TelemedicineCore__TokenTransferFailed();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -217,13 +219,6 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Initializes the contract with initial admins and external contract addresses
-    /// @param _initialAdmins List of initial admin addresses
-    /// @param _payments Address of TelemedicinePayments contract
-    /// @param _disputeResolution Address of TelemedicineDisputeResolution contract
-    /// @param _services Address of TelemedicineMedicalServices contract
-    /// @param _chainlinkOracle Address of Chainlink oracle
-    /// @param _priceListJobId Chainlink job ID for price feeds
-    /// @param _linkToken Address of LINK token on Sonic
     function initialize(
         address[] memory _initialAdmins,
         address _payments,
@@ -288,6 +283,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         linkToken = LinkTokenInterface(_linkToken);
         chainlinkFee = 0.1 ether;
 
+        _validatePercentages();
         emit AuditLog(block.timestamp, msg.sender, "Contract Initialized");
     }
 
@@ -298,18 +294,19 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Updates configuration parameters (admin only)
-    /// @param _parameter Enum-based parameter to update
-    /// @param _value New value for the parameter
     function updateConfiguration(ConfigParameter _parameter, uint256 _value) external onlyRole(ADMIN_ROLE) {
         if (_parameter == ConfigParameter.DoctorFeePercentage) {
             if (_value > 100) revert TelemedicineCore__InvalidPercentage();
             doctorFeePercentage = _value;
+            _validatePercentages();
         } else if (_parameter == ConfigParameter.ReserveFundPercentage) {
             if (_value > 100) revert TelemedicineCore__InvalidPercentage();
             reserveFundPercentage = _value;
+            _validatePercentages();
         } else if (_parameter == ConfigParameter.PlatformFeePercentage) {
             if (_value > 100) revert TelemedicineCore__InvalidPercentage();
             platformFeePercentage = _value;
+            _validatePercentages();
         } else if (_parameter == ConfigParameter.DisputeWindow) {
             if (_value < 1 days || _value > 30 days) revert TelemedicineCore__InvalidParameterValue();
             disputeWindow = uint48(_value);
@@ -367,12 +364,10 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         } else {
             revert TelemedicineCore__UnknownParameter();
         }
-        _validatePercentages();
         emit ConfigurationUpdated(_parameter, _value);
     }
 
     /// @notice Registers a new patient with a hash of the encrypted symmetric key
-    /// @param _encryptedSymmetricKeyHash Hash of the patient's encrypted symmetric key
     function registerPatient(bytes32 _encryptedSymmetricKeyHash) external whenNotPaused {
         if (patients[msg.sender].isRegistered) revert TelemedicineCore__InvalidStatus();
         patients[msg.sender] = Patient(
@@ -440,6 +435,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         if (_labTech == address(0)) revert TelemedicineCore__InvalidAddress();
         labTechnicians[_labTech] = LabTechnician(true, _licenseNumber);
         _grantRole(LAB_TECH_ROLE, _labTech);
+        services.registerLabTech(_labTech);
         emit LabTechnicianVerified(_labTech);
     }
 
@@ -448,6 +444,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         if (_pharmacy == address(0)) revert TelemedicineCore__InvalidAddress();
         pharmacies[_pharmacy] = Pharmacy(true, _licenseNumber);
         _grantRole(PHARMACY_ROLE, _pharmacy);
+        services.registerPharmacy(_pharmacy);
         emit PharmacyRegistered(_pharmacy);
     }
 
@@ -459,7 +456,6 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Deposits funds into the reserve fund for a specific payment type (admin only)
-    /// @param _paymentType Type of payment (ETH, USDC, SONIC)
     function depositReserveFund(TelemedicinePayments.PaymentType _paymentType) external payable onlyRole(ADMIN_ROLE) {
         if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
             if (msg.value == 0) revert TelemedicineCore__InsufficientFunds();
@@ -467,23 +463,70 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
             emit ReserveFundDeposited(msg.sender, msg.value, _paymentType);
             _checkMinBalance(_paymentType);
         } else {
-            uint256 amount;
             IERC20Upgradeable token;
+            uint256 amount;
             if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
                 token = payments.usdcToken();
                 amount = token.balanceOf(msg.sender);
                 if (amount == 0) revert TelemedicineCore__InsufficientFunds();
-                token.transferFrom(msg.sender, address(this), amount);
-                reserveFundUSDC += amount;
+                try token.transferFrom(msg.sender, address(this), amount) returns (bool success) {
+                    if (!success) revert TelemedicineCore__TokenTransferFailed();
+                    reserveFundUSDC += amount;
+                } catch {
+                    revert TelemedicineCore__TokenTransferFailed();
+                }
             } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
                 token = payments.sonicToken();
                 amount = token.balanceOf(msg.sender);
                 if (amount == 0) revert TelemedicineCore__InsufficientFunds();
-                token.transferFrom(msg.sender, address(this), amount);
-                reserveFundSONIC += amount;
+                try token.transferFrom(msg.sender, address(this), amount) returns (bool success) {
+                    if (!success) revert TelemedicineCore__TokenTransferFailed();
+                    reserveFundSONIC += amount;
+                } catch {
+                    revert TelemedicineCore__TokenTransferFailed();
+                }
+            } else {
+                revert TelemedicineCore__InvalidStatus();
             }
             emit ReserveFundDeposited(msg.sender, amount, _paymentType);
             _checkMinBalance(_paymentType);
+        }
+    }
+
+    /// @notice Updates the reserve fund balance for a specific payment type (payments only)
+    function updateReserveFund(TelemedicinePayments.PaymentType _paymentType, uint256 _amount) external {
+        if (msg.sender != address(payments)) revert TelemedicineCore__NotAuthorized();
+        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+            reserveFundETH = _amount;
+        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+            reserveFundUSDC = _amount;
+        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
+            reserveFundSONIC = _amount;
+        } else {
+            revert TelemedicineCore__InvalidStatus();
+        }
+        _checkMinBalance(_paymentType);
+        emit ReserveFundUpdated(_paymentType, _amount);
+    }
+
+    /// @notice Batch updates reserve fund balances for multiple payment types (payments only)
+    function batchUpdateReserveFund(TelemedicinePayments.PaymentType[] calldata _paymentTypes, uint256[] calldata _amounts) external {
+        if (msg.sender != address(payments)) revert TelemedicineCore__NotAuthorized();
+        if (_paymentTypes.length != _amounts.length || _paymentTypes.length > maxBatchSize) revert TelemedicineCore__InvalidParameterValue();
+        for (uint256 i = 0; i < _paymentTypes.length; i++) {
+            TelemedicinePayments.PaymentType paymentType = _paymentTypes[i];
+            uint256 amount = _amounts[i];
+            if (paymentType == TelemedicinePayments.PaymentType.ETH) {
+                reserveFundETH = amount;
+            } else if (paymentType == TelemedicinePayments.PaymentType.USDC) {
+                reserveFundUSDC = amount;
+            } else if (paymentType == TelemedicinePayments.PaymentType.SONIC) {
+                reserveFundSONIC = amount;
+            } else {
+                revert TelemedicineCore__InvalidStatus();
+            }
+            _checkMinBalance(paymentType);
+            emit ReserveFundUpdated(paymentType, amount);
         }
     }
 
@@ -508,7 +551,6 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Requests a price feed from Chainlink oracle (admin only)
-    /// @param _serviceId IPFS hash or identifier for the service
     function requestPriceFeed(string calldata _serviceId) external onlyRole(ADMIN_ROLE) returns (bytes32) {
         if (linkToken.balanceOf(address(this)) < MIN_LINK_BALANCE) revert TelemedicineCore__InsufficientLinkBalance();
 
@@ -524,24 +566,18 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Handles Chainlink oracle response
-    /// @param _requestId The Chainlink request ID
-    /// @param _price The returned price value
     function fulfill(bytes32 _requestId, uint256 _price) public recordChainlinkFulfillment(_requestId) {
         chainlinkRequestToPrice[_requestId] = _price;
         emit ChainlinkPriceReceived(_requestId, _price);
     }
 
     /// @notice Grants roles to multiple accounts in a single transaction (admin only)
-    /// @param _role The role to grant
-    /// @param _accounts List of accounts to receive the role
     function grantBatchRoles(bytes32 _role, address[] calldata _accounts) external onlyRole(ADMIN_ROLE) {
         if (_accounts.length > maxBatchSize) revert TelemedicineCore__InvalidParameterValue();
         _grantBatchRoles(_role, _accounts);
     }
 
     /// @notice Configures discount levels for patient tiers (admin only)
-    /// @param _level The patient level
-    /// @param _discountPercentage Discount percentage (0-100)
     function setDiscountLevel(uint8 _level, uint256 _discountPercentage) external onlyRole(ADMIN_ROLE) {
         if (_level == 0 || _level > maxLevel) revert TelemedicineCore__InvalidParameterValue();
         if (_discountPercentage > 100) revert TelemedicineCore__InvalidPercentage();
@@ -552,7 +588,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
 
     /// @notice Validates fee percentages sum to 100
     function _validatePercentages() private view {
-        if (doctorFeePercentage + reserveFundPercentage + platformFeePercentage != 100)
+        if (doctorFeePercentage + reserveFundPercentage + platformFeePercentage != PERCENTAGE_DENOMINATOR)
             revert TelemedicineCore__InvalidPercentage();
     }
 
@@ -612,16 +648,8 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Checks if the reserve balance for a payment type is below the minimum
-    /// @param _paymentType Type of payment (ETH, USDC, SONIC)
     function _checkMinBalance(TelemedicinePayments.PaymentType _paymentType) internal {
-        uint256 balance;
-        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
-            balance = reserveFundETH;
-        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
-            balance = reserveFundUSDC;
-        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
-            balance = reserveFundSONIC;
-        }
+        uint256 balance = getReserveFundBalance(_paymentType);
         if (balance < minReserveBalance) {
             emit MinBalanceAlert(address(this), balance, _paymentType);
         }
@@ -656,7 +684,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         return aiAnalysisFund;
     }
 
-    function getReserveFundBalance(TelemedicinePayments.PaymentType _paymentType) external view returns (uint256) {
+    function getReserveFundBalance(TelemedicinePayments.PaymentType _paymentType) public view returns (uint256) {
         if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
             return reserveFundETH;
         } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
@@ -664,7 +692,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
             return reserveFundSONIC;
         }
-        return 0;
+        revert TelemedicineCore__InvalidStatus();
     }
 
     function getLinkBalance() external view returns (uint256) {
@@ -673,6 +701,11 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
 
     function paused() external view returns (bool) {
         return super.paused();
+    }
+
+    /// @notice Checks if an address is a config admin
+    function isConfigAdmin(address _account) external view returns (bool) {
+        return hasRole(ADMIN_ROLE, _account);
     }
 
     // Modifiers
