@@ -54,7 +54,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         bool isPriority;
         bytes32 videoCallLinkHash;
         uint48 disputeWindowEnd;
-        DisputeOutcome disputeOutcome;
+        TelemedicineCore.DisputeOutcome disputeOutcome;
     }
 
     struct LabTestOrder {
@@ -70,7 +70,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         string resultsIpfsHash;
         uint256 patientCost;
         uint48 disputeWindowEnd;
-        DisputeOutcome disputeOutcome;
+        TelemedicineCore.DisputeOutcome disputeOutcome;
         uint48 sampleCollectionDeadline;
         uint48 resultsUploadDeadline;
         TelemedicinePayments.PaymentType paymentType;
@@ -89,7 +89,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         string prescriptionIpfsHash;
         uint256 patientCost;
         uint48 disputeWindowEnd;
-        DisputeOutcome disputeOutcome;
+        TelemedicineCore.DisputeOutcome disputeOutcome;
     }
 
     struct AISymptomAnalysis {
@@ -110,7 +110,6 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     enum AppointmentStatus { Pending, Confirmed, Completed, Cancelled, Rescheduled, Emergency, Disputed }
     enum LabTestStatus { Requested, PaymentPending, Collected, ResultsUploaded, Reviewed, Disputed, Expired }
     enum PrescriptionStatus { Generated, PaymentPending, Verified, Fulfilled, Revoked, Expired, Disputed }
-    enum DisputeOutcome { Unresolved, PatientFavored, ProviderFavored, MutualAgreement }
 
     // Storage
     mapping(uint256 => Appointment) public appointments;
@@ -220,7 +219,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
             revert InvalidParameter("Original prescription must be in Disputed status");
 
         // Prevent duplicate replacement prescriptions
-        if (original.disputeOutcome != DisputeOutcome.Unresolved) 
+        if (original.disputeOutcome != TelemedicineCore.DisputeOutcome.Unresolved) 
             revert InvalidParameter("Replacement already processed or dispute resolved");
 
         // Validate new pharmacy address
@@ -232,8 +231,11 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
             revert InvalidParameter("New pharmacy cannot be the same as the original");
 
         // Validate pharmacy role
-        if (!core.hasRole(core.PHARMACY_ROLE(), _newPharmacy)) 
-            revert InvalidParameter("New pharmacy is not authorized");
+        try core.hasRole(core.PHARMACY_ROLE(), _newPharmacy) returns (bool hasRole) {
+            if (!hasRole) revert InvalidParameter("New pharmacy is not authorized");
+        } catch {
+            revert ExternalCallFailed();
+        }
 
         // Increment prescription counter
         prescriptionCounter = prescriptionCounter.add(1);
@@ -253,12 +255,12 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
             prescriptionIpfsHash: original.prescriptionIpfsHash,
             patientCost: original.patientCost,
             disputeWindowEnd: uint48(block.timestamp.add(core.disputeWindow())),
-            disputeOutcome: DisputeOutcome.Unresolved
+            disputeOutcome: TelemedicineCore.DisputeOutcome.Unresolved
         });
 
         // Mark original prescription as replaced
         original.status = PrescriptionStatus.Revoked;
-        original.disputeOutcome = DisputeOutcome.ProviderFavored;
+        original.disputeOutcome = TelemedicineCore.DisputeOutcome.ProviderFavored;
 
         // Emit event
         emit ReplacementPrescriptionIssued(newPrescriptionId, _originalPrescriptionId, _operationHash);
@@ -314,7 +316,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     /// @notice Retrieves appointment details
     /// @param _appointmentId Appointment ID
     /// @return Appointment struct
-    function appointments(uint256 _appointmentId) external view returns (Appointment memory) {
+    function getAppointment(uint256 _appointmentId) external view returns (Appointment memory) {
         if (_appointmentId == 0 || _appointmentId > appointmentCounter) revert InvalidIndex();
         return appointments[_appointmentId];
     }
@@ -322,7 +324,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     /// @notice Retrieves lab test order details
     /// @param _labTestId Lab test ID
     /// @return LabTestOrder struct
-    function labTestOrders(uint256 _labTestId) external view returns (LabTestOrder memory) {
+    function getLabTestOrder(uint256 _labTestId) external view returns (LabTestOrder memory) {
         if (_labTestId == 0 || _labTestId > labTestCounter) revert InvalidIndex();
         return labTestOrders[_labTestId];
     }
@@ -330,7 +332,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     /// @notice Retrieves prescription details
     /// @param _prescriptionId Prescription ID
     /// @return Prescription struct
-    function prescriptions(uint256 _prescriptionId) external view returns (Prescription memory) {
+    function getPrescription(uint256 _prescriptionId) external view returns (Prescription memory) {
         if (_prescriptionId == 0 || _prescriptionId > prescriptionCounter) revert InvalidIndex();
         return prescriptions[_prescriptionId];
     }
@@ -338,17 +340,17 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     /// @notice Retrieves AI symptom analysis details
     /// @param _analysisId Analysis ID
     /// @return AISymptomAnalysis struct
-    function aiAnalyses(uint256 _analysisId) external view returns (AISymptomAnalysis memory) {
+    function getAIAnalysis(uint256 _analysisId) external view returns (AISymptomAnalysis memory) {
         if (_analysisId == 0 || _analysisId > aiAnalysisCounter) revert InvalidIndex();
         return aiAnalyses[_analysisId];
     }
 
     /// @notice Retrieves pending appointments for a doctor
     /// @param _doctor Doctor address
-    /// @return PendingAppointments struct
-    function doctorPendingAppointments(address _doctor) external view returns (PendingAppointments memory) {
+    /// @return Array of pending appointment IDs
+    function getDoctorPendingAppointments(address _doctor) external view returns (uint256[] memory) {
         if (_doctor == address(0)) revert InvalidAddress();
-        return doctorPendingAppointments[_doctor];
+        return doctorPendingAppointments[_doctor].ids;
     }
 
     // State Modification Functions (Restricted)
@@ -360,7 +362,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     function updateAppointmentStatus(
         uint256 _appointmentId,
         AppointmentStatus _status,
-        DisputeOutcome _disputeOutcome
+        TelemedicineCore.DisputeOutcome _disputeOutcome
     ) external onlyAuthorizedContract {
         if (_appointmentId == 0 || _appointmentId > appointmentCounter) revert InvalidIndex();
         Appointment storage apt = appointments[_appointmentId];
@@ -375,7 +377,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     function updateLabTestStatus(
         uint256 _labTestId,
         LabTestStatus _status,
-        DisputeOutcome _disputeOutcome
+        TelemedicineCore.DisputeOutcome _disputeOutcome
     ) external onlyAuthorizedContract {
         if (_labTestId == 0 || _labTestId > labTestCounter) revert InvalidIndex();
         LabTestOrder storage order = labTestOrders[_labTestId];
@@ -390,7 +392,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     function updatePrescriptionStatus(
         uint256 _prescriptionId,
         PrescriptionStatus _status,
-        DisputeOutcome _disputeOutcome
+        TelemedicineCore.DisputeOutcome _disputeOutcome
     ) external onlyAuthorizedContract {
         if (_prescriptionId == 0 || _prescriptionId > prescriptionCounter) revert InvalidIndex();
         Prescription storage prescription = prescriptions[_prescriptionId];
@@ -414,8 +416,12 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     /// @notice Restricts access to a specific role
     /// @param role The role required
     modifier onlyRole(bytes32 role) {
-        if (!core.hasRole(role, msg.sender)) revert NotAuthorized();
-        _;
+        try core.hasRole(role, msg.sender) returns (bool hasRole) {
+            if (!hasRole) revert NotAuthorized();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
 
     /// @notice Restricts access to authorized contracts
@@ -426,8 +432,12 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
 
     /// @notice Ensures the contract is not paused
     modifier whenNotPaused() {
-        if (core.paused()) revert ContractPaused();
-        _;
+        try core.paused() returns (bool isPaused) {
+            if (isPaused) revert ContractPaused();
+            _;
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
 
     // Fallback
