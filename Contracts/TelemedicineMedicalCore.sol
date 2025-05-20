@@ -11,7 +11,7 @@ import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ER
 import {TelemedicineCore} from "./TelemedicineCore.sol";
 import {TelemedicinePayments} from "./TelemedicinePayments.sol";
 import {TelemedicineDisputeResolution} from "./TelemedicineDisputeResolution.sol";
-import {TelemedicineMedicalServices} from "./TelemedicineMedicalServices.sol"; // New: Import TelemedicineMedicalServices
+import {TelemedicineMedicalServices} from "./TelemedicineMedicalServices.sol";
 
 /// @title TelemedicineMedicalCore
 /// @notice Central contract for managing medical data and core logic for appointments, lab tests, prescriptions, and AI analyses
@@ -24,16 +24,16 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     TelemedicineCore public core;
     TelemedicinePayments public payments;
     TelemedicineDisputeResolution public disputeResolution;
-    TelemedicineMedicalServices public services; // New: Reference to TelemedicineMedicalServices
+    TelemedicineMedicalServices public services;
 
     // Configuration
     address public chainlinkOracle;
     bytes32 public priceListJobId;
     uint256 public chainlinkFee;
     bool public manualPriceOverride;
-    uint256 public versionNumber; // Track contract version
-    uint48 public invitationExpirationPeriod; // Configurable invitation expiration
-    uint256 public maxBatchSize; // Max batch size for queries
+    uint256 public versionNumber;
+    uint48 public invitationExpirationPeriod;
+    uint256 public maxBatchSize;
 
     // Counters
     uint256 public appointmentCounter;
@@ -41,7 +41,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     uint256 public prescriptionCounter;
     uint256 public aiAnalysisCounter;
 
-    // Data Structures (aligned with TelemedicineOperations)
+    // Data Structures
     struct Appointment {
         uint256 id;
         address patient;
@@ -103,7 +103,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     struct PendingAppointments {
         uint256[] ids;
         mapping(uint256 => uint256) indices;
-        uint256 count; // Track total count
+        uint256 count;
     }
 
     // Enums
@@ -123,17 +123,21 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     error NotAuthorized();
     error ContractPaused();
     error InvalidAddress();
-    error InvalidParameter();
+    error InvalidParameter(string message);
     error InvalidIndex();
     error ExternalCallFailed();
 
     // Events
-    event Initialized(address core, address payments, address disputeResolution, address services); // Updated: Include services
+    event Initialized(address core, address payments, address disputeResolution, address services);
     event ChainlinkConfigUpdated(address oracle, bytes32 jobId, uint256 fee);
     event ManualPriceOverrideToggled(bool enabled);
     event ConfigurationUpdated(string parameter, uint256 value);
     event VersionUpgraded(uint256 newVersion);
-    event ReplacementPrescriptionOrdered(uint256 indexed newPrescriptionId, uint256 indexed originalPrescriptionId, bytes32 operationHash); // New: Event for replacement prescription
+    event ReplacementPrescriptionIssued(
+        uint256 indexed newPrescriptionId, 
+        uint256 indexed originalPrescriptionId, 
+        bytes32 operationHash
+    );
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -152,13 +156,13 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         address _core,
         address _payments,
         address _disputeResolution,
-        address _services, // New: Add services parameter
+        address _services,
         address _chainlinkOracle,
         bytes32 _priceListJobId,
         uint256 _chainlinkFee
     ) external initializer {
         if (_core == address(0) || _payments == address(0) || _disputeResolution == address(0) || 
-            _services == address(0) || _chainlinkOracle == address(0)) // Updated: Validate services address
+            _services == address(0) || _chainlinkOracle == address(0))
             revert InvalidAddress();
 
         __UUPSUpgradeable_init();
@@ -168,7 +172,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         core = TelemedicineCore(_core);
         payments = TelemedicinePayments(_payments);
         disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
-        services = TelemedicineMedicalServices(_services); // New: Set services
+        services = TelemedicineMedicalServices(_services);
         chainlinkOracle = _chainlinkOracle;
         priceListJobId = _priceListJobId;
         chainlinkFee = _chainlinkFee;
@@ -177,7 +181,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         maxBatchSize = 50;
         versionNumber = 1;
 
-        emit Initialized(_core, _payments, _disputeResolution, _services); // Updated: Emit services
+        emit Initialized(_core, _payments, _disputeResolution, _services);
         emit ChainlinkConfigUpdated(_chainlinkOracle, _priceListJobId, _chainlinkFee);
         emit ConfigurationUpdated("invitationExpirationPeriod", 30 days);
         emit ConfigurationUpdated("maxBatchSize", 50);
@@ -192,27 +196,57 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     /// @notice Orders a replacement prescription for a pharmacy dispute
     /// @param _originalPrescriptionId Original prescription ID
     /// @param _operationHash Operation hash for verification
+    /// @param _newPharmacy Address of the new pharmacy
     /// @return New prescription ID
-    function orderReplacementPrescription(uint256 _originalPrescriptionId, bytes32 _operationHash) 
+    function orderReplacementPrescription(
+        uint256 _originalPrescriptionId, 
+        bytes32 _operationHash, 
+        address _newPharmacy
+    ) 
         external 
         onlyAuthorizedContract 
         whenNotPaused 
         returns (uint256) 
     {
-        if (_originalPrescriptionId == 0 || _originalPrescriptionId > prescriptionCounter) revert InvalidIndex();
-        Prescription storage original = prescriptions[_originalPrescriptionId];
-        if (original.status != PrescriptionStatus.Disputed) revert InvalidParameter();
+        // Validate prescription ID
+        if (_originalPrescriptionId == 0 || _originalPrescriptionId > prescriptionCounter) 
+            revert InvalidIndex();
 
+        // Get original prescription
+        Prescription storage original = prescriptions[_originalPrescriptionId];
+
+        // Check original prescription status
+        if (original.status != PrescriptionStatus.Disputed) 
+            revert InvalidParameter("Original prescription must be in Disputed status");
+
+        // Prevent duplicate replacement prescriptions
+        if (original.disputeOutcome != DisputeOutcome.Unresolved) 
+            revert InvalidParameter("Replacement already processed or dispute resolved");
+
+        // Validate new pharmacy address
+        if (_newPharmacy == address(0)) 
+            revert InvalidAddress("New pharmacy address cannot be zero");
+        
+        // Prevent assigning to the same faulty pharmacy
+        if (_newPharmacy == original.pharmacy) 
+            revert InvalidParameter("New pharmacy cannot be the same as the original");
+
+        // Validate pharmacy role
+        if (!core.hasRole(core.PHARMACY_ROLE(), _newPharmacy)) 
+            revert InvalidParameter("New pharmacy is not authorized");
+
+        // Increment prescription counter
         prescriptionCounter = prescriptionCounter.add(1);
         uint256 newPrescriptionId = prescriptionCounter;
 
+        // Create new prescription
         prescriptions[newPrescriptionId] = Prescription({
             id: newPrescriptionId,
             patient: original.patient,
             doctor: original.doctor,
             verificationCodeHash: bytes32(0),
             status: PrescriptionStatus.Generated,
-            pharmacy: address(0),
+            pharmacy: _newPharmacy,
             generatedTimestamp: uint48(block.timestamp),
             expirationTimestamp: uint48(block.timestamp.add(core.verificationTimeout())),
             medicationIpfsHash: original.medicationIpfsHash,
@@ -222,18 +256,26 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
             disputeOutcome: DisputeOutcome.Unresolved
         });
 
-        emit ReplacementPrescriptionOrdered(newPrescriptionId, _originalPrescriptionId, _operationHash);
+        // Mark original prescription as replaced
+        original.status = PrescriptionStatus.Revoked;
+        original.disputeOutcome = DisputeOutcome.ProviderFavored;
+
+        // Emit event
+        emit ReplacementPrescriptionIssued(newPrescriptionId, _originalPrescriptionId, _operationHash);
+
         return newPrescriptionId;
     }
-
-    // Configuration Updates
 
     /// @notice Updates Chainlink configuration
     /// @param _newOracle New oracle address
     /// @param _newJobId New job ID
     /// @param _newFee New fee
-    function updateChainlinkConfig(address _newOracle, bytes32 _newJobId, uint256 _newFee) external onlyRole(core.ADMIN_ROLE()) {
-        if (_newOracle == address(0) || _newJobId == bytes32(0) || _newFee == 0) revert InvalidParameter();
+    function updateChainlinkConfig(address _newOracle, bytes32 _newJobId, uint256 _newFee) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+    {
+        if (_newOracle == address(0) || _newJobId == bytes32(0) || _newFee == 0) 
+            revert InvalidParameter("Invalid Chainlink configuration parameters");
         chainlinkOracle = _newOracle;
         priceListJobId = _newJobId;
         chainlinkFee = _newFee;
@@ -250,16 +292,19 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     /// @notice Updates configuration parameters
     /// @param _parameter Parameter name
     /// @param _value New value
-    function updateConfiguration(string calldata _parameter, uint256 _value) external onlyRole(core.ADMIN_ROLE()) {
+    function updateConfiguration(string calldata _parameter, uint256 _value) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+    {
         bytes32 paramHash = keccak256(abi.encodePacked(_parameter));
         if (paramHash == keccak256(abi.encodePacked("invitationExpirationPeriod"))) {
-            if (_value < 7 days) revert InvalidParameter();
+            if (_value < 7 days) revert InvalidParameter("Expiration period too short");
             invitationExpirationPeriod = uint48(_value);
         } else if (paramHash == keccak256(abi.encodePacked("maxBatchSize"))) {
-            if (_value == 0 || _value > 100) revert InvalidParameter();
+            if (_value == 0 || _value > 100) revert InvalidParameter("Invalid batch size");
             maxBatchSize = _value;
         } else {
-            revert InvalidParameter();
+            revert InvalidParameter("Unknown configuration parameter");
         }
         emit ConfigurationUpdated(_parameter, _value);
     }
@@ -360,7 +405,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         return msg.sender == address(core) ||
                msg.sender == address(payments) ||
                msg.sender == address(disputeResolution) ||
-               msg.sender == address(services) || // New: Authorize TelemedicineMedicalServices
+               msg.sender == address(services) ||
                core.hasRole(core.ADMIN_ROLE(), msg.sender);
     }
 
