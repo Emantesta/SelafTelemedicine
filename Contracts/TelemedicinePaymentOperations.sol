@@ -8,7 +8,6 @@ import {SafeMathUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/mat
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {TelemedicineCore} from "./TelemedicineCore.sol";
-import {TelemedicinePayments} from "./TelemedicinePayments.sol";
 import {TelemedicineDisputeResolution} from "./TelemedicineDisputeResolution.sol";
 import {TelemedicineBase} from "./TelemedicineBase.sol";
 import {TelemedicineClinicalOperations} from "./TelemedicineClinicalOperations.sol";
@@ -19,6 +18,7 @@ import {ITelemedicinePayments} from "./Interfaces/ITelemedicinePayments.sol";
 /// @title TelemedicinePaymentOperations
 /// @notice Manages payment operations, provider invitations, and pricing
 /// @dev UUPS upgradeable, integrates with core, payments, dispute, base, and clinical ops
+/// @dev Sonic ($S) reward validation is centralized in TelemedicinePayments via queuePayment
 contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable, ChainlinkClient {
     using SafeMathUpgradeable for uint256;
     using Chainlink for Chainlink.Request;
@@ -27,41 +27,41 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
 
     // Immutable Dependencies
     TelemedicineCore public immutable core;
-    TelemedicinePayments public immutable payments;
+    ITelemedicinePayments public immutable payments; // Updated: Use interface
     TelemedicineDisputeResolution public immutable disputeResolution;
     TelemedicineBase public immutable base;
     TelemedicineClinicalOperations public immutable clinicalOps;
 
     // Chainlink Configuration
-    mapping(bytes32 => uint256) private requestToLabTestId; // Updated: Private
-    mapping(bytes32 => uint256) private requestToPrescriptionId; // Updated: Private
-    mapping(bytes32 => uint48) private requestTimestamps; // Updated: Private
-    mapping(bytes32 => uint256) private chainlinkRetryCounts; // New: Track retries
+    mapping(bytes32 => uint256) private requestToLabTestId;
+    mapping(bytes32 => uint256) private requestToPrescriptionId;
+    mapping(bytes32 => uint48) private requestTimestamps;
+    mapping(bytes32 => uint256) private chainlinkRetryCounts;
 
     // State Variables
-    mapping(uint256 => bool) private labTestPayments; // Updated: Private
-    mapping(uint256 => bool) private prescriptionPayments; // Updated: Private
+    mapping(uint256 => bool) private labTestPayments;
+    mapping(uint256 => bool) private prescriptionPayments;
     mapping(uint256 => uint48) public labTestPaymentDeadlines;
     mapping(uint256 => uint48) public prescriptionPaymentDeadlines;
 
     struct PendingPayment {
         address recipient;
         uint256 amount;
-        ITelemedicinePayments.PaymentType paymentType; // Updated: Use interface
+        ITelemedicinePayments.PaymentType paymentType;
         bool processed;
     }
-    mapping(uint256 => PendingPayment) private pendingPayments; // Updated: Private
+    mapping(uint256 => PendingPayment) private pendingPayments;
     uint256 public pendingPaymentCounter;
 
     struct Invitation {
         address patient;
         string locality;
-        bytes32 inviteeContactHash; // Updated: Hashed contact
+        bytes32 inviteeContactHash;
         bool isLabTech;
         bool fulfilled;
         uint48 expirationTimestamp;
     }
-    mapping(bytes32 => Invitation) private invitations; // Updated: Private
+    mapping(bytes32 => Invitation) private invitations;
     uint256 public invitationCounter;
 
     // Medical Services State
@@ -69,17 +69,17 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
     mapping(address => mapping(string => PriceEntry)) private pharmacyPrices;
     mapping(address => uint256) private labTechIndex;
     mapping(address => uint256) private pharmacyIndex;
-    mapping(address => mapping(bytes32 => bool)) private multiSigApprovals; // Updated: Private
+    mapping(address => mapping(bytes32 => bool)) private multiSigApprovals;
     mapping(address => string) private labTechLocalities;
     mapping(address => string) private pharmacyLocalities;
-    mapping(string => address[]) private localityToLabTechs; // New: Optimize locality lookup
-    mapping(string => address[]) private localityToPharmacies; // New: Optimize locality lookup
+    mapping(string => address[]) private localityToLabTechs;
+    mapping(string => address[]) private localityToPharmacies;
 
     address[] public labTechList;
     address[] public pharmacyList;
     address[] public multiSigSigners;
     uint256 public requiredSignatures;
-    uint256 public versionNumber; // New: Track version
+    uint256 public versionNumber;
 
     // Structs
     struct PriceEntry {
@@ -88,9 +88,9 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
     }
 
     // Constants
-    uint256 public constant MIN_PRICE = 0.01 * 10**6; // New: 0.01 USDC (6 decimals)
-    uint256 public constant MAX_COUNTER = 1_000_000; // New: Limit counters
-    uint256 public constant MAX_RETRIES = 3; // New: Chainlink retry limit
+    uint256 public constant MIN_PRICE = 0.01 * 10**6; // 0.01 USDC (6 decimals)
+    uint256 public constant MAX_COUNTER = 1_000_000;
+    uint256 public constant MAX_RETRIES = 3;
 
     // Events
     event FundsWithdrawn(bytes32 indexed recipientHash, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
@@ -113,8 +113,8 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
     event PharmacyPriceUpdated(bytes32 indexed pharmacyHash, string medicationIpfsHash, uint256 price, uint48 timestamp);
     event DataRewardClaimed(bytes32 indexed patientHash, uint256 amount);
     event MultiSigApproval(bytes32 indexed signerHash, bytes32 indexed operationHash);
-    event ConfigurationUpdated(string indexed parameter, uint256 value); // New: Config updates
-    event MultiSigConfigUpdated(address[] signers, uint256 requiredSignatures); // New: Multi-sig updates
+    event ConfigurationUpdated(string indexed parameter, uint256 value);
+    event MultiSigConfigUpdated(address[] signers, uint256 requiredSignatures);
 
     // Errors
     error InvalidAddress();
@@ -141,9 +141,15 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
     error InvalidPaymentType();
     error ExternalCallFailed();
     error MaxRetriesExceeded();
+    error InvalidTimestamp(); // Added for cancelChainlinkRequest
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
+        core = TelemedicineCore(address(0)); // Avoid uninitialized immutable
+        payments = ITelemedicinePayments(address(0));
+        disputeResolution = TelemedicineDisputeResolution(address(0));
+        base = TelemedicineBase(address(0));
+        clinicalOps = TelemedicineClinicalOperations(address(0));
         _disableInitializers();
     }
 
@@ -175,7 +181,7 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         __ChainlinkClient_init();
 
         core = TelemedicineCore(_core);
-        payments = TelemedicinePayments(_payments);
+        payments = ITelemedicinePayments(_payments); // Updated: Use interface
         disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
         base = TelemedicineBase(_base);
         clinicalOps = TelemedicineClinicalOperations(_clinicalOps);
@@ -185,6 +191,13 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
 
         invitationCounter = 0;
         pendingPaymentCounter = 0;
+
+        // Initialize Chainlink
+        try core.linkToken() returns (address linkToken) {
+            setChainlinkToken(linkToken);
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
 
     /// @notice Returns the contract version
@@ -279,7 +292,7 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
                 }
             }
             if (msg.value > totalEthRequired) {
-                safeTransferETH(msg.sender, msg.value - totalEthRequired);
+                safeTransferETH(msg.sender, msg.value.sub(totalEthRequired));
             }
         }
     }
@@ -357,7 +370,10 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         } catch {
             revert ExternalCallFailed();
         }
-        if (manualOverride) return bytes32(0);
+        if (manualOverride) {
+            executeSetManualLabTestPrice(_labTestId, MIN_PRICE); // Default to MIN_PRICE
+            return bytes32(0);
+        }
 
         if (bytes(_testTypeIpfsHash).length == 0) revert InvalidIpfsHash();
         Chainlink.Request memory req = buildChainlinkRequest(
@@ -371,17 +387,13 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         try this.sendChainlinkRequestTo(base.chainlinkOracle(), req, base.chainlinkFee()) returns (bytes32 id) {
             requestId = id;
         } catch {
-            chainlinkRetryCounts[keccak256(abi.encode(_labTestId))] = chainlinkRetryCounts[keccak256(abi.encode(_labTestId))].add(1);
-            if (chainlinkRetryCounts[keccak256(abi.encode(_labTestId))] >= MAX_RETRIES) {
-                try base.manualPriceOverride() returns (bool override) {
-                    if (!override) {
-                        try base.toggleManualPriceOverride(true) {} catch {
-                            revert ExternalCallFailed();
-                        }
-                    }
-                } catch {
+            bytes32 retryKey = keccak256(abi.encode(_labTestId));
+            chainlinkRetryCounts[retryKey] = chainlinkRetryCounts[retryKey].add(1);
+            if (chainlinkRetryCounts[retryKey] >= MAX_RETRIES) {
+                try base.toggleManualPriceOverride(true) {} catch {
                     revert ExternalCallFailed();
                 }
+                executeSetManualLabTestPrice(_labTestId, MIN_PRICE); // Default to MIN_PRICE
                 return bytes32(0);
             }
             return requestLabTestPrice(_labTech, _testTypeIpfsHash, _labTestId);
@@ -401,15 +413,10 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         TelemedicineClinicalOperations.LabTestOrder storage order = clinicalOps.labTestOrders(labTestId);
         if (order.status != TelemedicineClinicalOperations.LabTestStatus.Requested) revert InvalidStatus();
         if (_price < MIN_PRICE) {
-            try base.manualPriceOverride() returns (bool override) {
-                if (!override) {
-                    try base.toggleManualPriceOverride(true) {} catch {
-                        revert ExternalCallFailed();
-                    }
-                }
-            } catch {
+            try base.toggleManualPriceOverride(true) {} catch {
                 revert ExternalCallFailed();
             }
+            executeSetManualLabTestPrice(labTestId, MIN_PRICE); // Default to MIN_PRICE
             delete requestToLabTestId[_requestId];
             delete requestTimestamps[_requestId];
             return;
@@ -440,7 +447,10 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         } catch {
             revert ExternalCallFailed();
         }
-        if (manualOverride) return bytes32(0);
+        if (manualOverride) {
+            executeSetManualPrescriptionPrice(_prescriptionId, MIN_PRICE); // Default to MIN_PRICE
+            return bytes32(0);
+        }
 
         if (bytes(_medicationIpfsHash).length == 0) revert InvalidIpfsHash();
         Chainlink.Request memory req = buildChainlinkRequest(
@@ -454,17 +464,13 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         try this.sendChainlinkRequestTo(base.chainlinkOracle(), req, base.chainlinkFee()) returns (bytes32 id) {
             requestId = id;
         } catch {
-            chainlinkRetryCounts[keccak256(abi.encode(_prescriptionId))] = chainlinkRetryCounts[keccak256(abi.encode(_prescriptionId))].add(1);
-            if (chainlinkRetryCounts[keccak256(abi.encode(_prescriptionId))] >= MAX_RETRIES) {
-                try base.manualPriceOverride() returns (bool override) {
-                    if (!override) {
-                        try base.toggleManualPriceOverride(true) {} catch {
-                            revert ExternalCallFailed();
-                        }
-                    }
-                } catch {
+            bytes32 retryKey = keccak256(abi.encode(_prescriptionId));
+            chainlinkRetryCounts[retryKey] = chainlinkRetryCounts[retryKey].add(1);
+            if (chainlinkRetryCounts[retryKey] >= MAX_RETRIES) {
+                try base.toggleManualPriceOverride(true) {} catch {
                     revert ExternalCallFailed();
                 }
+                executeSetManualPrescriptionPrice(_prescriptionId, MIN_PRICE); // Default to MIN_PRICE
                 return bytes32(0);
             }
             return requestPrescriptionPrice(_pharmacy, _medicationIpfsHash, _prescriptionId);
@@ -484,15 +490,10 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         TelemedicineClinicalOperations.Prescription storage prescription = clinicalOps.prescriptions(prescriptionId);
         if (prescription.status != TelemedicineClinicalOperations.PrescriptionStatus.Generated) revert InvalidStatus();
         if (_price < MIN_PRICE) {
-            try base.manualPriceOverride() returns (bool override) {
-                if (!override) {
-                    try base.toggleManualPriceOverride(true) {} catch {
-                        revert ExternalCallFailed();
-                    }
-                }
-            } catch {
+            try base.toggleManualPriceOverride(true) {} catch {
                 revert ExternalCallFailed();
             }
+            executeSetManualPrescriptionPrice(prescriptionId, MIN_PRICE); // Default to MIN_PRICE
             delete requestToPrescriptionId[_requestId];
             delete requestTimestamps[_requestId];
             return;
@@ -520,7 +521,7 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
             revert ExternalCallFailed();
         }
 
-        try this.cancelChainlinkRequest(_requestId) {} catch {
+        try this.cancelChainlinkRequest(_requestId, base.chainlinkFee(), address(this), this.fulfillLabTestPrice.selector) {} catch {
             revert ExternalCallFailed();
         }
         delete requestToLabTestId[_requestId];
@@ -547,21 +548,21 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         }
 
         if (isDisputed) {
-            TelemedicineMedicalCore.DisputeOutcome outcome; // Updated: Standardize
-            try disputeResolution.getDisputeOutcome(_labTestId) returns (TelemedicineMedicalCore.DisputeOutcome o) {
+            TelemedicineClinicalOperations.DisputeOutcome outcome; // Updated: Use ClinicalOperations enum
+            try disputeResolution.getDisputeOutcome(_labTestId) returns (TelemedicineClinicalOperations.DisputeOutcome o) {
                 outcome = o;
             } catch {
                 revert ExternalCallFailed();
             }
-            if (outcome == TelemedicineMedicalCore.DisputeOutcome.Unresolved) revert InvalidStatus();
+            if (outcome == TelemedicineClinicalOperations.DisputeOutcome.Unresolved) revert InvalidStatus();
 
-            if (outcome == TelemedicineMedicalCore.DisputeOutcome.PatientFavored) {
+            if (outcome == TelemedicineClinicalOperations.DisputeOutcome.PatientFavored) {
                 try payments._refundPatient(order.patient, order.patientCost, order.paymentType) {} catch {
                     revert ExternalCallFailed();
                 }
                 emit LabTestRefunded(_labTestId, keccak256(abi.encode(order.patient)), order.patientCost);
-            } else if (outcome == TelemedicineMedicalCore.DisputeOutcome.ProviderFavored ||
-                       outcome == TelemedicineMedicalCore.DisputeOutcome.MutualAgreement) {
+            } else if (outcome == TelemedicineClinicalOperations.DisputeOutcome.ProviderFavored ||
+                       outcome == TelemedicineClinicalOperations.DisputeOutcome.MutualAgreement) {
                 _releasePayment(order.labTech, order.patientCost, order.paymentType);
                 emit LabTestPaymentReleased(_labTestId, keccak256(abi.encode(order.labTech)), order.patientCost, order.paymentType);
             }
@@ -595,21 +596,21 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
         }
 
         if (isDisputed) {
-            TelemedicineMedicalCore.DisputeOutcome outcome; // Updated: Standardize
-            try disputeResolution.getDisputeOutcome(_prescriptionId) returns (TelemedicineMedicalCore.DisputeOutcome o) {
+            TelemedicineClinicalOperations.DisputeOutcome outcome; // Updated: Use ClinicalOperations enum
+            try disputeResolution.getDisputeOutcome(_prescriptionId) returns (TelemedicineClinicalOperations.DisputeOutcome o) {
                 outcome = o;
             } catch {
                 revert ExternalCallFailed();
             }
-            if (outcome == TelemedicineMedicalCore.DisputeOutcome.Unresolved) revert InvalidStatus();
+            if (outcome == TelemedicineClinicalOperations.DisputeOutcome.Unresolved) revert InvalidStatus();
 
-            if (outcome == TelemedicineMedicalCore.DisputeOutcome.PatientFavored) {
+            if (outcome == TelemedicineClinicalOperations.DisputeOutcome.PatientFavored) {
                 try payments._refundPatient(prescription.patient, prescription.patientCost, prescription.paymentType) {} catch {
                     revert ExternalCallFailed();
                 }
                 emit PrescriptionRefunded(_prescriptionId, keccak256(abi.encode(prescription.patient)), prescription.patientCost);
-            } else if (outcome == TelemedicineMedicalCore.DisputeOutcome.ProviderFavored ||
-                       outcome == TelemedicineMedicalCore.DisputeOutcome.MutualAgreement) {
+            } else if (outcome == TelemedicineClinicalOperations.DisputeOutcome.ProviderFavored ||
+                       outcome == TelemedicineClinicalOperations.DisputeOutcome.MutualAgreement) {
                 _releasePayment(prescription.pharmacy, prescription.patientCost, prescription.paymentType);
                 emit PrescriptionPaymentReleased(_prescriptionId, keccak256(abi.encode(prescription.pharmacy)), prescription.patientCost, prescription.paymentType);
             }
@@ -644,7 +645,7 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
             _paymentType
         );
         try core._queueTimeLock(
-            TelemedicineCore.TimeLockAction.FundWithdrawal, // Assumes GovernanceManager enum
+            TelemedicineCore.TimeLockAction.FundWithdrawal,
             address(this),
             0,
             data
@@ -695,7 +696,7 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
     /// @notice Executes manual lab test price
     /// @param _labTestId Lab test ID
     /// @param _price Price
-    function executeSetManualLabTestPrice(uint256 _labTestId, uint256 _price) external onlyConfigAdmin {
+    function executeSetManualLabTestPrice(uint256 _labTestId, uint256 _price) public onlyConfigAdmin {
         TelemedicineClinicalOperations.LabTestOrder storage order = clinicalOps.labTestOrders(_labTestId);
         if (order.status != TelemedicineClinicalOperations.LabTestStatus.Requested) revert InvalidStatus();
 
@@ -737,7 +738,7 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
     /// @notice Executes manual prescription price
     /// @param _prescriptionId Prescription ID
     /// @param _price Price
-    function executeSetManualPrescriptionPrice(uint256 _prescriptionId, uint256 _price) external onlyConfigAdmin {
+    function executeSetManualPrescriptionPrice(uint256 _prescriptionId, uint256 _price) public onlyConfigAdmin {
         TelemedicineClinicalOperations.Prescription storage prescription = clinicalOps.prescriptions(_prescriptionId);
         if (prescription.status != TelemedicineClinicalOperations.PrescriptionStatus.Generated) revert InvalidStatus();
 
@@ -807,10 +808,11 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
             PendingPayment storage payment = pendingPayments[i];
             if (payment.processed || payment.amount == 0) continue;
 
-            if (_hasSufficientFunds(payment.amount, payment.paymentType)) {
-                _releasePayment(payment.recipient, payment.amount, payment.paymentType);
+            try payments.queuePayment(payment.recipient, payment.amount, payment.paymentType) {
                 payment.processed = true;
                 emit PaymentReleasedFromQueue(i, keccak256(abi.encode(payment.recipient)), payment.amount);
+            } catch {
+                // Skip failed payments to continue processing
             }
         }
     }
@@ -860,18 +862,14 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
             return;
         }
 
-        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
-            safeTransferETH(_to, _amount);
-        } else if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
-            try payments.usdcToken().safeTransfer(_to, _amount) {} catch {
-                revert ExternalCallFailed();
-            }
-        } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
-            try payments.sonicToken().safeTransfer(_to, _amount) {} catch {
-                revert ExternalCallFailed();
-            }
-        } else {
-            revert InvalidPaymentType();
+        try payments.queuePayment(_to, _amount, _paymentType) {
+            // Success, validation handled by TelemedicinePayments
+        } catch {
+            // Queue payment on failure
+            if (pendingPaymentCounter >= MAX_COUNTER) revert CounterOverflow();
+            pendingPaymentCounter = pendingPaymentCounter.add(1);
+            pendingPayments[pendingPaymentCounter] = PendingPayment(_to, _amount, _paymentType, false);
+            emit PaymentQueued(pendingPaymentCounter, keccak256(abi.encode(_to)), _amount, _paymentType);
         }
     }
 
@@ -889,7 +887,7 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
                 return false;
             }
         } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
-            try payments.sonicToken().balanceOf(address(this)) returns (uint256 balance) {
+            try payments.sonicNativeToken().balanceOf(address(this)) returns (uint256 balance) {
                 return balance >= _amount;
             } catch {
                 return false;
@@ -972,13 +970,17 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
             } catch {
                 revert ExternalCallFailed();
             }
-            if (payments.sonicToken().balanceOf(address(payments)) < reward) return;
 
-            patient.lastRewardTimestamp = uint48(block.timestamp);
-            try payments.sonicToken().safeTransfer(_patient, reward) {} catch {
-                revert ExternalCallFailed();
+            // Validate reward bounds
+            (uint256 minReward, uint256 maxReward) = payments.getRewardBounds();
+            if (reward < minReward || reward > maxReward) revert ITelemedicinePayments.InvalidRewardAmount();
+
+            try payments.queuePayment(_patient, reward, ITelemedicinePayments.PaymentType.SONIC) {
+                patient.lastRewardTimestamp = uint48(block.timestamp);
+                emit DataRewardClaimed(keccak256(abi.encode(_patient)), reward);
+            } catch {
+                // Log failure but don't revert
             }
-            emit DataRewardClaimed(keccak256(abi.encode(_patient)), reward);
         } catch {
             revert ExternalCallFailed();
         }
@@ -991,7 +993,7 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
     function notifyDisputeResolved(
         uint256 _id,
         string memory _entityType,
-        TelemedicineMedicalCore.DisputeOutcome _outcome
+        TelemedicineClinicalOperations.DisputeOutcome _outcome
     ) public onlyClinicalOps {
         // No-op, handled by ClinicalOperations
     }
@@ -1232,6 +1234,6 @@ contract TelemedicinePaymentOperations is Initializable, UUPSUpgradeable, Reentr
 
     receive() external payable {}
 
-    // New: Storage gap
+    // Storage gap
     uint256[50] private __gap;
 }
