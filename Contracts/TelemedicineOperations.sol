@@ -11,10 +11,14 @@ import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {ChainlinkClient, Chainlink} from "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 import "./TelemedicineCore.sol";
+import "./ITelemedicinePayments.sol";
+import "./TelemedicineDisputeResolution.sol";
+import "./TelemedicineMedicalServices.sol";
 
 /// @title TelemedicineOperations
 /// @notice Manages appointments, lab tests, prescriptions, AI symptom analyses, payment queues, and provider invitations
 /// @dev UUPS upgradeable, integrates with Chainlink for pricing and AI services, uses SafeERC20 for token transfers
+/// @dev Sonic $S reward validation is centralized in TelemedicinePayments
 contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, ChainlinkClient {
     using SafeMathUpgradeable for uint256;
     using AddressUpgradeable for address payable;
@@ -94,7 +98,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     struct PendingPayment {
         address recipient;
         uint256 amount;
-        TelemedicinePayments.PaymentType paymentType;
+        ITelemedicinePayments.PaymentType paymentType;
         bool processed;
     }
     mapping(uint256 => PendingPayment) public pendingPayments;
@@ -118,7 +122,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         uint48 scheduledTimestamp;
         AppointmentStatus status;
         uint96 fee;
-        TelemedicinePayments.PaymentType paymentType;
+        ITelemedicinePayments.PaymentType paymentType;
         bool isVideoCall;
         bool isPriority;
         bytes32 videoCallLinkHash;
@@ -142,7 +146,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         DisputeOutcome disputeOutcome;
         uint48 sampleCollectionDeadline;
         uint48 resultsUploadDeadline;
-        TelemedicinePayments.PaymentType paymentType;
+        ITelemedicinePayments.PaymentType paymentType;
     }
 
     struct Prescription {
@@ -172,7 +176,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         uint48 requestTimestamp;
         uint48 disputeWindowEnd;
         DisputeOutcome disputeOutcome;
-        TelemedicinePayments.PaymentType paymentType;
+        ITelemedicinePayments.PaymentType paymentType;
     }
 
     struct PendingAppointments {
@@ -195,7 +199,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
 
     // External Contracts
     TelemedicineCore public core;
-    TelemedicinePayments public payments;
+    ITelemedicinePayments public payments;
     TelemedicineDisputeResolution public disputeResolution;
     TelemedicineMedicalServices public services;
 
@@ -210,15 +214,15 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     event PrescriptionIssued(uint256 indexed prescriptionId, address patient, address doctor, bytes32 verificationCodeHash, uint48 issuedAt);
     event PrescriptionVerified(uint256 indexed prescriptionId, address pharmacy);
     event PrescriptionFulfilled(uint256 indexed prescriptionId);
-    event DoctorPaid(uint256 indexed appointmentId, address indexed doctor, uint256 amount, TelemedicinePayments.PaymentType paymentType);
-    event ReserveFundAllocated(uint256 indexed appointmentId, uint256 amount, TelemedicinePayments.PaymentType paymentType);
-    event PlatformFeeAllocated(uint256 indexed appointmentId, uint256 amount, TelemedicinePayments.PaymentType paymentType);
+    event DoctorPaid(uint256 indexed appointmentId, address indexed doctor, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
+    event ReserveFundAllocated(uint256 indexed appointmentId, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
+    event PlatformFeeAllocated(uint256 indexed appointmentId, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
     event InvitationSubmitted(bytes32 indexed invitationId, address patient, string locality, bool isLabTech);
     event InvitationFulfilled(bytes32 indexed invitationId, address invitee);
     event InvitationExpired(bytes32 indexed invitationId);
     event LabTestPaymentConfirmed(uint256 indexed testId, uint256 amount);
     event PrescriptionPaymentConfirmed(uint256 indexed prescriptionId, uint256 amount);
-    event PaymentQueued(uint256 indexed paymentId, address recipient, uint256 amount, TelemedicinePayments.PaymentType paymentType);
+    event PaymentQueued(uint256 indexed paymentId, address recipient, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
     event PaymentReleasedFromQueue(uint256 indexed paymentId, address recipient, uint256 amount);
     event MaxPendingAppointmentsUpdated(uint256 newMax);
     event ChainlinkTimeoutUpdated(uint48 newTimeout);
@@ -252,7 +256,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         setChainlinkToken(address(TelemedicineCore(_core).linkToken()));
 
         core = TelemedicineCore(_core);
-        payments = TelemedicinePayments(_payments);
+        payments = ITelemedicinePayments(_payments);
         disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
         services = TelemedicineMedicalServices(_services);
 
@@ -312,7 +316,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     function bookAppointment(
         address[] calldata _doctors,
         uint48 _timestamp,
-        TelemedicinePayments.PaymentType _paymentType,
+        ITelemedicinePayments.PaymentType _paymentType,
         bool _isVideoCall,
         bytes32 _videoCallLinkHash
     ) external payable onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
@@ -322,7 +326,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         }
         if (_timestamp <= block.timestamp + core.minBookingBuffer()) revert InvalidTimestamp();
         if (_isVideoCall && _videoCallLinkHash == bytes32(0)) revert InvalidIpfsHash();
-        if (disputeResolution.isDisputed(appointmentCounter + 1)) revert InvalidStatus(); // Check for disputes
+        if (disputeResolution.isDisputed(appointmentCounter + 1)) revert InvalidStatus();
 
         core.decayPoints(msg.sender);
         uint256 baseFee = 0;
@@ -362,7 +366,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         patient.gamification.mediPoints = uint96(patient.gamification.mediPoints.add(core.pointsForActions("appointment")));
         patient.lastActivityTimestamp = uint48(block.timestamp);
 
-        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
             if (msg.value < discountedFee) revert InsufficientFunds();
             core.reserveFundETH = core.reserveFundETH.add(reserveAmount);
             emit ReserveFundAllocated(newAppointmentId, reserveAmount, _paymentType);
@@ -372,11 +376,11 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
             }
         } else {
             try payments._processPayment(_paymentType, discountedFee) {
-                if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+                if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
                     payments.usdcToken().safeTransferFrom(address(payments), address(this), reserveAmount);
                     core.reserveFundUSDC = core.reserveFundUSDC.add(reserveAmount);
-                } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
-                    payments.sonicToken().safeTransferFrom(address(payments), address(this), reserveAmount);
+                } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+                    payments.sonicNativeToken().safeTransferFrom(address(payments), address(this), reserveAmount);
                     core.reserveFundSONIC = core.reserveFundSONIC.add(reserveAmount);
                 }
                 emit ReserveFundAllocated(newAppointmentId, reserveAmount, _paymentType);
@@ -472,7 +476,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         }
 
         if (apt.disputeOutcome != DisputeOutcome.Unresolved) {
-            try services.notifyDisputeResolved(_appointmentId, "Appointment", apt.disputeOutcome, disputeId) {
+            try services.notifyDisputeResolved(_appointmentId, "Appointment", apt.disputeOutcome) {
                 // Success
             } catch {
                 revert ExternalCallFailed();
@@ -498,8 +502,8 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         address selectedLabTech = selectBestLabTech(_testTypeIpfsHash, _locality);
         if (selectedLabTech == address(0)) revert NoLabTechAvailable();
 
-        (uint256 price, bool isValid, uint48 sampleDeadline, uint48 resultsDeadline) = services.getLabTestDetails(selectedLabTech, _testTypeIpfsHash);
-        if (sampleDeadline < block.timestamp + 1 hours || resultsDeadline < sampleDeadline + 1 hours) revert InvalidTimestamp();
+        (uint256 price, bool isValid) = services.getLabTechPrice(selectedLabTech, _testTypeIpfsHash);
+        if (!isValid) revert InvalidStatus();
 
         labTestCounter = labTestCounter.add(1);
         uint256 newTestId = labTestCounter;
@@ -515,18 +519,17 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
             testTypeIpfsHash: _testTypeIpfsHash,
             sampleCollectionIpfsHash: "",
             resultsIpfsHash: "",
-            patientCost: 0,
+            patientCost: price.mul(120).div(core.PERCENTAGE_DENOMINATOR()),
             disputeWindowEnd: uint48(block.timestamp).add(core.disputeWindow()),
             disputeOutcome: DisputeOutcome.Unresolved,
-            sampleCollectionDeadline: sampleDeadline,
-            resultsUploadDeadline: resultsDeadline,
-            paymentType: TelemedicinePayments.PaymentType.ETH
+            sampleCollectionDeadline: uint48(block.timestamp + 7 days),
+            resultsUploadDeadline: uint48(block.timestamp + 14 days),
+            paymentType: ITelemedicinePayments.PaymentType.ETH
         });
 
-        if (!isValid || price == 0) {
+        if (price == 0) {
             requestLabTestPrice(selectedLabTech, _testTypeIpfsHash, newTestId);
         } else {
-            labTestOrders[newTestId].patientCost = price.mul(120).div(core.PERCENTAGE_DENOMINATOR());
             if (msg.value < labTestOrders[newTestId].patientCost) revert InsufficientFunds();
             labTestPayments[newTestId] = true;
             emit LabTestPaymentConfirmed(newTestId, labTestOrders[newTestId].patientCost);
@@ -536,7 +539,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         }
 
         emit LabTestOrdered(newTestId, _patient, msg.sender, _testTypeIpfsHash, uint48(block.timestamp));
-        try services.monetizeData(_patient) {
+        try services.monetizeData(_patient, labTestOrders[newTestId].patientCost) {
             // Success
         } catch {
             // Log failure but don't revert
@@ -636,7 +639,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         }
 
         emit PrescriptionIssued(newPrescriptionId, _patient, msg.sender, verificationCodeHash, uint48(block.timestamp));
-        try services.monetizeData(_patient) {
+        try services.monetizeData(_patient, prescriptions[newPrescriptionId].patientCost) {
             // Success
         } catch {
             // Log failure but don't revert
@@ -692,7 +695,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @notice Requests an AI symptom analysis
     /// @param _symptoms Description of patient symptoms
     /// @param _paymentType Payment type (ETH, USDC, SONIC)
-    function requestAISymptomAnalysis(string calldata _symptoms, TelemedicinePayments.PaymentType _paymentType)
+    function requestAISymptomAnalysis(string calldata _symptoms, ITelemedicinePayments.PaymentType _paymentType)
         external payable onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused
     {
         if (bytes(_symptoms).length < MIN_SYMPTOMS_LENGTH || bytes(_symptoms).length > MAX_SYMPTOMS_LENGTH) revert InvalidSymptoms();
@@ -715,7 +718,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
             paymentType: _paymentType
         });
 
-        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
             if (msg.value < aiAnalysisFee) revert InsufficientFunds();
             uint256 reserveAmount = aiAnalysisFee.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
             core.reserveFundETH = core.reserveFundETH.add(reserveAmount);
@@ -726,11 +729,11 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         } else {
             try payments._processPayment(_paymentType, aiAnalysisFee) {
                 uint256 reserveAmount = aiAnalysisFee.mul(core.reserveFundPercentage()).div(core.PERCENTAGE_DENOMINATOR());
-                if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+                if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
                     payments.usdcToken().safeTransferFrom(address(payments), address(this), reserveAmount);
                     core.reserveFundUSDC = core.reserveFundUSDC.add(reserveAmount);
-                } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
-                    payments.sonicToken().safeTransferFrom(address(payments), address(this), reserveAmount);
+                } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+                    payments.sonicNativeToken().safeTransferFrom(address(payments), address(this), reserveAmount);
                     core.reserveFundSONIC = core.reserveFundSONIC.add(reserveAmount);
                 }
                 emit ReserveFundAllocated(newAnalysisId, reserveAmount, _paymentType);
@@ -793,7 +796,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         delete requestTimestamps[_requestId];
         emit AISymptomAnalysisFulfilled(analysisId, _analysisIpfsHash);
 
-        try services.monetizeData(analysis.patient) {
+        try services.monetizeData(analysis.patient, analysis.cost) {
             // Success
         } catch {
             // Log failure but don't revert
@@ -843,7 +846,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         emit DoctorPaid(_analysisId, msg.sender, reviewFee, analysis.paymentType);
 
         if (outcome != DisputeOutcome.Unresolved) {
-            try services.notifyDisputeResolved(_analysisId, "AISymptomAnalysis", outcome, disputeId) {
+            try services.notifyDisputeResolved(_analysisId, "AISymptomAnalysis", outcome) {
                 // Success
             } catch {
                 revert ExternalCallFailed();
@@ -917,8 +920,8 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         if (_providerAddress == address(0)) revert InvalidAddress();
 
         try invitation.isLabTech ?
-            services.registerLabTech(_providerAddress, invitation.locality) :
-            services.registerPharmacy(_providerAddress, invitation.locality)
+            services.registerLabTech(_providerAddress) :
+            services.registerPharmacy(_providerAddress)
         {
             invitation.fulfilled = true;
             emit InvitationFulfilled(_invitationId, _providerAddress);
@@ -935,16 +938,11 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         for (uint256 i = 0; i < _paymentIds.length; i++) {
             PendingPayment storage payment = pendingPayments[_paymentIds[i]];
             if (payment.processed || payment.recipient == address(0)) continue;
-            if (_hasSufficientFunds(payment.amount, payment.paymentType)) {
-                payment.processed = true;
-                if (payment.paymentType == TelemedicinePayments.PaymentType.ETH) {
-                    _safeTransferETH(payment.recipient, payment.amount);
-                } else if (payment.paymentType == TelemedicinePayments.PaymentType.USDC) {
-                    payments.usdcToken().safeTransfer(payment.recipient, payment.amount);
-                } else if (payment.paymentType == TelemedicinePayments.PaymentType.SONIC) {
-                    payments.sonicToken().safeTransfer(payment.recipient, payment.amount);
-                }
+            payment.processed = true;
+            try payments.queuePayment(payment.recipient, payment.amount, payment.paymentType) {
                 emit PaymentReleasedFromQueue(_paymentIds[i], payment.recipient, payment.amount);
+            } catch {
+                payment.processed = false; // Revert processing status on failure
             }
         }
     }
@@ -994,7 +992,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _locality Locality for selection
     /// @return Selected lab technician address
     function selectBestLabTech(string memory _testTypeIpfsHash, string memory _locality) internal view returns (address) {
-        (address[] memory labTechs, ) = services.getLabTechsInLocality(_locality, 0, core.maxBatchSize());
+        (address[] memory labTechs, ) = services.getLabTechs(0, core.maxBatchSize());
         if (labTechs.length == 0) return address(0);
 
         address bestLabTech = address(0);
@@ -1004,10 +1002,8 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
         uint256 maxIterations = labTechs.length > core.maxBatchSize() ? core.maxBatchSize() : labTechs.length;
         for (uint256 i = 0; i < maxIterations; i++) {
             if (!services.isLabTechRegistered(labTechs[i])) continue;
-            (uint256 price, bool isValid, , ) = services.getLabTestDetails(labTechs[i], _testTypeIpfsHash);
+            (uint256 price, bool isValid) = services.getLabTechPrice(labTechs[i], _testTypeIpfsHash);
             if (!isValid || price == 0) continue;
-            uint256 capacity = services.getLabTechCapacity(labTechs[i]);
-            if (capacity == 0) continue;
 
             if (fallbackTech == address(0)) fallbackTech = labTechs[i];
             (uint256 avgRating, uint256 ratingCount) = services.getLabTechRating(labTechs[i]);
@@ -1033,7 +1029,7 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _to Recipient address
     /// @param _amount Amount to transfer
     /// @param _paymentType Payment type
-    function _releasePayment(address _to, uint256 _amount, TelemedicinePayments.PaymentType _paymentType) internal {
+    function _releasePayment(address _to, uint256 _amount, ITelemedicinePayments.PaymentType _paymentType) internal {
         if (!_hasSufficientFunds(_amount, _paymentType)) {
             pendingPaymentCounter = pendingPaymentCounter.add(1);
             pendingPayments[pendingPaymentCounter] = PendingPayment(_to, _amount, _paymentType, false);
@@ -1041,12 +1037,13 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
             return;
         }
 
-        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
-            _safeTransferETH(_to, _amount);
-        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
-            payments.usdcToken().safeTransfer(_to, _amount);
-        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
-            payments.sonicToken().safeTransfer(_to, _amount);
+        try payments.queuePayment(_to, _amount, _paymentType) {
+            // Success, validation handled by TelemedicinePayments
+        } catch {
+            // Queue payment on failure
+            pendingPaymentCounter = pendingPaymentCounter.add(1);
+            pendingPayments[pendingPaymentCounter] = PendingPayment(_to, _amount, _paymentType, false);
+            emit PaymentQueued(pendingPaymentCounter, _to, _amount, _paymentType);
         }
     }
 
@@ -1054,13 +1051,13 @@ contract TelemedicineOperations is Initializable, UUPSUpgradeable, ReentrancyGua
     /// @param _amount Amount to check
     /// @param _paymentType Payment type
     /// @return True if funds are sufficient
-    function _hasSufficientFunds(uint256 _amount, TelemedicinePayments.PaymentType _paymentType) internal view returns (bool) {
-        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+    function _hasSufficientFunds(uint256 _amount, ITelemedicinePayments.PaymentType _paymentType) internal view returns (bool) {
+        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
             return address(this).balance >= _amount;
-        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
             return payments.usdcToken().balanceOf(address(this)) >= _amount;
-        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
-            return payments.sonicToken().balanceOf(address(this)) >= _amount;
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+            return payments.sonicNativeToken().balanceOf(address(this)) >= _amount;
         }
         return false;
     }
