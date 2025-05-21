@@ -14,6 +14,7 @@ import {TelemedicineMedicalCore} from "./TelemedicineMedicalCore.sol";
 /// @title TelemedicineMedicalServices
 /// @notice Manages lab technician and pharmacy services, pricing, ratings, disputes, and data monetization
 /// @dev UUPS upgradeable, integrates with TelemedicineCore, Payments, DisputeResolution, and MedicalCore
+/// @dev Optimized for Sonic Blockchain (EVM-compatible L2). Use Sonic-specific token and dependency addresses.
 contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable {
     using SafeMathUpgradeable for uint256;
     using SafeERC20Upgradeable for IERC20Upgradeable;
@@ -50,17 +51,17 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     // Configuration Constants
     uint48 public constant RATING_WINDOW = 7 days;
     uint256 public constant MAX_RATING = 5;
-    uint256 public constant MAX_BATCH_SIZE = 50;
+    uint256 public maxBatchSize; // Updated: Configurable batch size
     uint256 public constant PERCENTAGE_DENOMINATOR = 100;
-    uint256 public constant MAX_SIGNERS = 10; // New: Limit multi-sig signers
-    uint256 public constant MIN_IPFS_HASH_LENGTH = 46; // New: Standard IPFS hash length
-    uint48 public priceExpirationPeriod; // New: Configurable price expiration
+    uint256 public constant MAX_SIGNERS = 10;
+    uint256 public constant MIN_IPFS_HASH_LENGTH = 46;
+    uint48 public priceExpirationPeriod;
 
     // State Variables
     mapping(address => mapping(string => PriceEntry)) private labTechPrices;
     mapping(address => mapping(string => PriceEntry)) private pharmacyPrices;
-    mapping(address => bytes32) private labTechPriceListIpfsHash; // Updated: Store hash
-    mapping(address => bytes32) private pharmacyPriceListIpfsHash; // Updated: Store hash
+    mapping(address => bytes32) private labTechPriceListIpfsHash;
+    mapping(address => bytes32) private pharmacyPriceListIpfsHash;
     mapping(address => uint256) private labTechIndex;
     mapping(address => uint256) private pharmacyIndex;
     mapping(address => mapping(uint256 => Rating)) private labTestRatings;
@@ -69,7 +70,7 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     mapping(address => uint256) private pharmacyRatingSum;
     mapping(address => uint256) private labTechRatingCount;
     mapping(address => uint256) private pharmacyRatingCount;
-    mapping(bytes32 => MultiSigOperation) private operations; // New: Track multi-sig operations
+    mapping(bytes32 => MultiSigOperation) private operations;
 
     address[] public labTechList;
     address[] public pharmacyList;
@@ -88,7 +89,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         bool exists;
     }
 
-    // New: Multi-sig operation tracking
     struct MultiSigOperation {
         uint256 approvalCount;
         mapping(address => bool) approvals;
@@ -108,6 +108,7 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     event DataRewardClaimed(address indexed patient, uint256 amount);
     event MultiSigApproval(address indexed signer, bytes32 indexed operationHash);
     event PriceExpirationPeriodUpdated(uint48 newPeriod);
+    event MaxBatchSizeUpdated(uint256 newSize); // New: Event for batch size updates
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -115,10 +116,10 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     }
 
     /// @notice Initializes the medical services contract with dependencies and multi-sig configuration
-    /// @param _core Address of the TelemedicineCore contract
-    /// @param _payments Address of the TelemedicinePayments contract
-    /// @param _disputeResolution Address of the TelemedicineDisputeResolution contract
-    /// @param _medicalCore Address of the TelemedicineMedicalCore contract
+    /// @param _core Address of the TelemedicineCore contract (Sonic-specific)
+    /// @param _payments Address of the TelemedicinePayments contract (Sonic-specific)
+    /// @param _disputeResolution Address of the TelemedicineDisputeResolution contract (Sonic-specific)
+    /// @param _medicalCore Address of the TelemedicineMedicalCore contract (Sonic-specific)
     /// @param _multiSigSigners Array of multi-sig signer addresses
     /// @param _requiredSignatures Number of required signatures for multi-sig approval
     function initialize(
@@ -133,7 +134,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
             _medicalCore == address(0)) revert InvalidAddress();
         if (_multiSigSigners.length < _requiredSignatures || _requiredSignatures == 0 ||
             _multiSigSigners.length > MAX_SIGNERS) revert InvalidMultiSigConfig();
-        // New: Check for duplicate signers
         for (uint256 i = 0; i < _multiSigSigners.length; i++) {
             if (_multiSigSigners[i] == address(0)) revert InvalidAddress();
             for (uint256 j = i + 1; j < _multiSigSigners.length; j++) {
@@ -149,9 +149,11 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         medicalCore = TelemedicineMedicalCore(_medicalCore);
         multiSigSigners = _multiSigSigners;
         requiredSignatures = _requiredSignatures;
-        priceExpirationPeriod = 30 days; // New: Configurable default
+        priceExpirationPeriod = 30 days;
+        maxBatchSize = 50; // Optimized for Sonic's low gas costs
 
         emit PriceExpirationPeriodUpdated(30 days);
+        emit MaxBatchSizeUpdated(50);
     }
 
     /// @notice Authorizes contract upgrades (admin only)
@@ -223,13 +225,14 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         whenNotPaused 
     {
         if (labTechIndex[msg.sender] == 0) revert NotRegistered();
-        if (_testTypeIpfsHashes.length != _prices.length || _testTypeIpfsHashes.length > MAX_BATCH_SIZE) 
+        if (_testTypeIpfsHashes.length != _prices.length || _testTypeIpfsHashes.length > maxBatchSize) 
             revert InvalidPageSize();
-        for (uint256 i = 0; i < _testTypeIpfsHashes.length; i++) {
+        for (uint256 i = 0; i < _testTypeIpfsHashes.length; ) {
             if (bytes(_testTypeIpfsHashes[i]).length < MIN_IPFS_HASH_LENGTH) revert InvalidIpfsHash();
             if (_prices[i] == 0) revert InvalidPrice();
             labTechPrices[msg.sender][_testTypeIpfsHashes[i]] = PriceEntry(_prices[i], uint48(block.timestamp));
             emit LabTechPriceUpdated(msg.sender, _testTypeIpfsHashes[i], _prices[i], uint48(block.timestamp));
+            unchecked { i++; } // Gas optimization
         }
         emit LabTechPricesBatchUpdated(msg.sender, _testTypeIpfsHashes.length);
     }
@@ -244,13 +247,14 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         whenNotPaused 
     {
         if (pharmacyIndex[msg.sender] == 0) revert NotRegistered();
-        if (_medicationIpfsHashes.length != _prices.length || _medicationIpfsHashes.length > MAX_BATCH_SIZE) 
+        if (_medicationIpfsHashes.length != _prices.length || _medicationIpfsHashes.length > maxBatchSize) 
             revert InvalidPageSize();
-        for (uint256 i = 0; i < _medicationIpfsHashes.length; i++) {
+        for (uint256 i = 0; i < _medicationIpfsHashes.length; ) {
             if (bytes(_medicationIpfsHashes[i]).length < MIN_IPFS_HASH_LENGTH) revert InvalidIpfsHash();
             if (_prices[i] == 0) revert InvalidPrice();
             pharmacyPrices[msg.sender][_medicationIpfsHashes[i]] = PriceEntry(_prices[i], uint48(block.timestamp));
             emit PharmacyPriceUpdated(msg.sender, _medicationIpfsHashes[i], _prices[i], uint48(block.timestamp));
+            unchecked { i++; } // Gas optimization
         }
         emit PharmacyPricesBatchUpdated(msg.sender, _medicationIpfsHashes.length);
     }
@@ -261,6 +265,14 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         if (_newPeriod < 7 days) revert InvalidTimestamp();
         priceExpirationPeriod = _newPeriod;
         emit PriceExpirationPeriodUpdated(_newPeriod);
+    }
+
+    /// @notice Updates the maximum batch size (admin only)
+    /// @param _newSize New batch size (1 to 100)
+    function updateMaxBatchSize(uint256 _newSize) external onlyRole(core.ADMIN_ROLE()) {
+        if (_newSize < 1 || _newSize > 100) revert InvalidPageSize();
+        maxBatchSize = _newSize;
+        emit MaxBatchSizeUpdated(_newSize);
     }
 
     // Rating System
@@ -280,7 +292,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         if (_labTestId == 0 || _labTestId > medicalCore.labTestCounter()) revert InvalidIndex();
         if (_rating == 0 || _rating > MAX_RATING) revert InvalidRating();
         if (block.timestamp > order.completedTimestamp + RATING_WINDOW) revert RatingWindowExpired();
-        // Updated: Allow multiple ratings per test, track by patient
         if (labTestRatings[msg.sender][_labTestId].exists) revert AlreadyRated();
 
         labTestRatings[msg.sender][_labTestId] = Rating(_rating, uint48(block.timestamp), true);
@@ -327,7 +338,7 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         if (disputeResolution.isDisputed(_serviceId)) revert DisputeWindowActive();
 
         bytes32 serviceTypeHash = keccak256(abi.encodePacked(_serviceType));
-        uint48 disputeWindow = core.disputeWindow(); // Updated: Use TelemedicineCore's disputeWindow
+        uint48 disputeWindow = core.disputeWindow();
 
         if (serviceTypeHash == keccak256(abi.encodePacked("Appointment"))) {
             if (_serviceId > medicalCore.appointmentCounter()) revert InvalidIndex();
@@ -337,13 +348,13 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
                 block.timestamp > apt.disputeWindowEnd) revert DisputeWindowActive();
             
             medicalCore.appointments(_serviceId).status = TelemedicineMedicalCore.AppointmentStatus.Disputed;
-            // Updated: Try-catch for external call
             try disputeResolution.initiateDispute(
                 apt.doctors[0], 
                 address(0), 
                 address(0), 
                 TelemedicineDisputeResolution.DisputeType.Misdiagnosis, 
-                _serviceId
+                _serviceId,
+                _serviceType // Updated: Pass serviceType
             ) {
                 emit DisputeInitiated(_serviceId, "Appointment", apt.patient, apt.doctors[0]);
             } catch {
@@ -362,7 +373,8 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
                 order.labTech, 
                 address(0), 
                 TelemedicineDisputeResolution.DisputeType.LabError, 
-                _serviceId
+                _serviceId,
+                _serviceType // Updated: Pass serviceType
             ) {
                 emit DisputeInitiated(_serviceId, "LabTest", order.patient, order.labTech);
             } catch {
@@ -381,7 +393,8 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
                 address(0), 
                 prescription.pharmacy, 
                 TelemedicineDisputeResolution.DisputeType.PharmacyError, 
-                _serviceId
+                _serviceId,
+                _serviceType // Updated: Pass serviceType
             ) {
                 emit DisputeInitiated(_serviceId, "Prescription", prescription.patient, prescription.pharmacy);
             } catch {
@@ -399,14 +412,12 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     function monetizeData(address _patient) external onlyMedicalCore {
         TelemedicineCore.Patient memory patient = core.patients(_patient);
         if (patient.dataSharing != TelemedicineCore.DataSharingStatus.Enabled) revert NotAuthorized();
-        // Updated: Use lastActivityTimestamp instead of lastRewardTimestamp
         if (block.timestamp < patient.lastActivityTimestamp + 1 days) revert InvalidTimestamp();
 
         uint256 reward = core.dataMonetizationReward();
         IERC20Upgradeable sonicToken = payments.sonicToken();
         if (sonicToken.balanceOf(address(payments)) < reward) revert InsufficientFunds();
 
-        // Updated: Use SafeERC20
         sonicToken.safeTransferFrom(address(payments), _patient, reward);
         emit DataRewardClaimed(_patient, reward);
     }
@@ -431,11 +442,12 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     /// @param _operationHash Hash of the operation to approve
     function approveCriticalOperation(bytes32 _operationHash) external {
         bool isSigner = false;
-        for (uint256 i = 0; i < multiSigSigners.length; i++) {
+        for (uint256 i = 0; i < multiSigSigners.length; ) {
             if (multiSigSigners[i] == msg.sender) {
                 isSigner = true;
                 break;
             }
+            unchecked { i++; } // Gas optimization
         }
         if (!isSigner) revert NotAuthorized();
         MultiSigOperation storage operation = operations[_operationHash];
@@ -479,7 +491,7 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         view 
         returns (uint256[] memory appointmentIds, uint256 totalPages) 
     {
-        if (_pageSize == 0 || _pageSize > MAX_BATCH_SIZE) revert InvalidPageSize();
+        if (_pageSize == 0 || _pageSize > maxBatchSize) revert InvalidPageSize();
         if (_doctor == address(0)) revert InvalidAddress();
 
         TelemedicineMedicalCore.PendingAppointments memory pending = medicalCore.doctorPendingAppointments(_doctor);
@@ -490,7 +502,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         uint256 end = start + _pageSize > pending.count ? pending.count : start + _pageSize;
         appointmentIds = new uint256[](end - start);
 
-        // Updated: Optimize loop with unchecked increment
         for (uint256 i = start; i < end; ) {
             appointmentIds[i - start] = pending.ids[i];
             unchecked { i++; }
@@ -506,7 +517,7 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         view 
         returns (address[] memory labTechs, uint256 totalPages) 
     {
-        if (_pageSize == 0 || _pageSize > MAX_BATCH_SIZE) revert InvalidPageSize();
+        if (_pageSize == 0 || _pageSize > maxBatchSize) revert InvalidPageSize();
         totalPages = (labTechList.length + _pageSize - 1) / _pageSize;
         if (_page >= totalPages) return (new address[](0), totalPages);
 
@@ -529,7 +540,7 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         view 
         returns (address[] memory pharmacies, uint256 totalPages) 
     {
-        if (_pageSize == 0 || _pageSize > MAX_BATCH_SIZE) revert InvalidPageSize();
+        if (_pageSize == 0 || _pageSize > maxBatchSize) revert InvalidPageSize();
         totalPages = (pharmacyList.length + _pageSize - 1) / _pageSize;
         if (_page >= totalPages) return (new address[](0), totalPages);
 
@@ -733,6 +744,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         _;
     }
 
-    // New: Storage gap for future upgrades
+    // Storage gap
     uint256[50] private __gap;
 }
