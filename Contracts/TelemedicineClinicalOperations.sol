@@ -43,7 +43,6 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
     uint64 public constant MIN_RESULTS_DEADLINE = 1 days;
     uint64 public constant MAX_DISPUTE_WINDOW = 7 days;
     uint64 public constant REVIEW_DEADLINE = 15 minutes;
-    uint64 public constant RECENT_APPOINTMENT_WINDOW = 7 days;
     bytes32 private immutable SALT;
 
     // Enums
@@ -522,7 +521,7 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
 
         // Check for recent appointment
         (uint256 appointmentId, uint64 appointmentTimestamp, bool isCompleted) = getRecentAppointment(msg.sender);
-        if (appointmentId == 0 || !isCompleted || block.timestamp > appointmentTimestamp.add(RECENT_APPOINTMENT_WINDOW)) {
+        if (appointmentId == 0 || !isCompleted || block.timestamp > appointmentTimestamp.add(medicalCore.recentAppointmentWindow())) {
             revert NoRecentAppointment();
         }
 
@@ -652,13 +651,12 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         uint256[] memory completedIds = medicalCore.getPatientCompletedAppointments(_patient);
         if (completedIds.length == 0) return (0, 0, false);
 
-        // Find the most recent completed appointment within RECENT_APPOINTMENT_WINDOW
         uint256 latestId = 0;
         uint64 latestTimestamp = 0;
         for (uint256 i = 0; i < completedIds.length; i++) {
             TelemedicineMedicalCore.Appointment memory apt = medicalCore.getAppointment(completedIds[i]);
             if (apt.status == TelemedicineMedicalCore.AppointmentStatus.Completed &&
-                block.timestamp <= apt.scheduledTimestamp.add(RECENT_APPOINTMENT_WINDOW) &&
+                block.timestamp <= apt.scheduledTimestamp.add(medicalCore.recentAppointmentWindow()) &&
                 apt.scheduledTimestamp > latestTimestamp) {
                 latestId = apt.id;
                 latestTimestamp = apt.scheduledTimestamp;
