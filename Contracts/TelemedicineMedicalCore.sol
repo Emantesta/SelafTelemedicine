@@ -106,6 +106,12 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         uint256 count;
     }
 
+    // New: Patient-to-Completed-Appointments Mapping
+    struct CompletedAppointments {
+        uint256[] ids;
+        uint256 count;
+    }
+
     // Enums
     enum AppointmentStatus { Pending, Confirmed, Completed, Cancelled, Rescheduled, Emergency, Disputed }
     enum LabTestStatus { Requested, PaymentPending, Collected, ResultsUploaded, Reviewed, Disputed, Expired }
@@ -117,6 +123,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     mapping(uint256 => Prescription) public prescriptions;
     mapping(uint256 => AISymptomAnalysis) public aiAnalyses;
     mapping(address => PendingAppointments) public doctorPendingAppointments;
+    mapping(address => CompletedAppointments) public patientCompletedAppointments; // New: Tracks completed appointments per patient
 
     // Errors
     error NotAuthorized();
@@ -137,6 +144,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         uint256 indexed originalPrescriptionId, 
         bytes32 operationHash
     );
+    event AppointmentCompleted(uint256 indexed appointmentId, address indexed patient); // New: Signals completed appointment
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -207,41 +215,28 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         whenNotPaused 
         returns (uint256) 
     {
-        // Validate prescription ID
         if (_originalPrescriptionId == 0 || _originalPrescriptionId > prescriptionCounter) 
             revert InvalidIndex();
 
-        // Get original prescription
         Prescription storage original = prescriptions[_originalPrescriptionId];
-
-        // Check original prescription status
         if (original.status != PrescriptionStatus.Disputed) 
             revert InvalidParameter("Original prescription must be in Disputed status");
-
-        // Prevent duplicate replacement prescriptions
         if (original.disputeOutcome != TelemedicineCore.DisputeOutcome.Unresolved) 
             revert InvalidParameter("Replacement already processed or dispute resolved");
-
-        // Validate new pharmacy address
         if (_newPharmacy == address(0)) 
             revert InvalidAddress("New pharmacy address cannot be zero");
-        
-        // Prevent assigning to the same faulty pharmacy
         if (_newPharmacy == original.pharmacy) 
             revert InvalidParameter("New pharmacy cannot be the same as the original");
 
-        // Validate pharmacy role
         try core.hasRole(core.PHARMACY_ROLE(), _newPharmacy) returns (bool hasRole) {
             if (!hasRole) revert InvalidParameter("New pharmacy is not authorized");
         } catch {
             revert ExternalCallFailed();
         }
 
-        // Increment prescription counter
         prescriptionCounter = prescriptionCounter.add(1);
         uint256 newPrescriptionId = prescriptionCounter;
 
-        // Create new prescription
         prescriptions[newPrescriptionId] = Prescription({
             id: newPrescriptionId,
             patient: original.patient,
@@ -258,14 +253,40 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
             disputeOutcome: TelemedicineCore.DisputeOutcome.Unresolved
         });
 
-        // Mark original prescription as replaced
         original.status = PrescriptionStatus.Revoked;
         original.disputeOutcome = TelemedicineCore.DisputeOutcome.ProviderFavored;
 
-        // Emit event
         emit ReplacementPrescriptionIssued(newPrescriptionId, _originalPrescriptionId, _operationHash);
-
         return newPrescriptionId;
+    }
+
+    /// @notice Updates appointment status and dispute outcome, records completed appointments
+    /// @param _appointmentId Appointment ID
+    /// @param _status New status
+    /// @param _disputeOutcome Dispute outcome
+    function updateAppointmentStatus(
+        uint256 _appointmentId,
+        AppointmentStatus _status,
+        TelemedicineCore.DisputeOutcome _disputeOutcome
+    ) external onlyAuthorizedContract {
+        if (_appointmentId == 0 || _appointmentId > appointmentCounter) revert InvalidIndex();
+        Appointment storage apt = appointments[_appointmentId];
+        if (_status == AppointmentStatus.Completed && apt.status != AppointmentStatus.Completed) {
+            CompletedAppointments storage completed = patientCompletedAppointments[apt.patient];
+            completed.ids.push(_appointmentId);
+            completed.count = completed.count.add(1);
+            emit AppointmentCompleted(_appointmentId, apt.patient);
+        }
+        apt.status = _status;
+        apt.disputeOutcome = _disputeOutcome;
+    }
+
+    /// @notice Retrieves completed appointment IDs for a patient
+    /// @param _patient Patient address
+    /// @return Array of completed appointment IDs
+    function getPatientCompletedAppointments(address _patient) external view returns (uint256[] memory) {
+        if (_patient == address(0)) revert InvalidAddress();
+        return patientCompletedAppointments[_patient].ids;
     }
 
     /// @notice Updates Chainlink configuration
@@ -354,21 +375,6 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     }
 
     // State Modification Functions (Restricted)
-
-    /// @notice Updates appointment status and dispute outcome
-    /// @param _appointmentId Appointment ID
-    /// @param _status New status
-    /// @param _disputeOutcome Dispute outcome
-    function updateAppointmentStatus(
-        uint256 _appointmentId,
-        AppointmentStatus _status,
-        TelemedicineCore.DisputeOutcome _disputeOutcome
-    ) external onlyAuthorizedContract {
-        if (_appointmentId == 0 || _appointmentId > appointmentCounter) revert InvalidIndex();
-        Appointment storage apt = appointments[_appointmentId];
-        apt.status = _status;
-        apt.disputeOutcome = _disputeOutcome;
-    }
 
     /// @notice Updates lab test order status and dispute outcome
     /// @param _labTestId Lab test ID
