@@ -34,6 +34,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     uint256 public versionNumber;
     uint48 public invitationExpirationPeriod;
     uint256 public maxBatchSize;
+    uint64 public recentAppointmentWindow; // Configurable, default 7 days
 
     // Counters
     uint256 public appointmentCounter;
@@ -106,7 +107,6 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         uint256 count;
     }
 
-    // New: Patient-to-Completed-Appointments Mapping
     struct CompletedAppointments {
         uint256[] ids;
         uint256 count;
@@ -123,7 +123,9 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     mapping(uint256 => Prescription) public prescriptions;
     mapping(uint256 => AISymptomAnalysis) public aiAnalyses;
     mapping(address => PendingAppointments) public doctorPendingAppointments;
-    mapping(address => CompletedAppointments) public patientCompletedAppointments; // New: Tracks completed appointments per patient
+    mapping(address => CompletedAppointments) public patientCompletedAppointments;
+    // Future: Separate dispute storage
+    // mapping(address => uint256[]) public patientDisputedAppointments;
 
     // Errors
     error NotAuthorized();
@@ -132,6 +134,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     error InvalidParameter(string message);
     error InvalidIndex();
     error ExternalCallFailed();
+    error NoAppointmentsToPrune();
 
     // Events
     event Initialized(address core, address payments, address disputeResolution, address services);
@@ -144,7 +147,8 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         uint256 indexed originalPrescriptionId, 
         bytes32 operationHash
     );
-    event AppointmentCompleted(uint256 indexed appointmentId, address indexed patient); // New: Signals completed appointment
+    event AppointmentCompleted(uint256 indexed appointmentId, address indexed patient);
+    event OldAppointmentsPruned(address indexed patient, uint256 indexed prunedCount);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -185,19 +189,198 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         chainlinkFee = _chainlinkFee;
         manualPriceOverride = false;
         invitationExpirationPeriod = 30 days;
-        maxBatchSize = 50;
+        maxBatchSize = 10; // Optimized for batch pruning
+        recentAppointmentWindow = 7 days; // Configurable
         versionNumber = 1;
 
         emit Initialized(_core, _payments, _disputeResolution, _services);
         emit ChainlinkConfigUpdated(_chainlinkOracle, _priceListJobId, _chainlinkFee);
         emit ConfigurationUpdated("invitationExpirationPeriod", 30 days);
-        emit ConfigurationUpdated("maxBatchSize", 50);
+        emit ConfigurationUpdated("maxBatchSize", 10);
+        emit ConfigurationUpdated("recentAppointmentWindow", 7 days);
     }
 
     /// @notice Authorizes contract upgrades (admin only)
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(core.ADMIN_ROLE()) {
         versionNumber = versionNumber.add(1);
         emit VersionUpgraded(versionNumber);
+    }
+
+    /// @notice Removes completed appointments older than recentAppointmentWindow for a patient, preserving unresolved disputes
+    /// @param _patient Patient address
+    /// @return prunedCount Number of appointments pruned
+    function removeOldCompletedAppointments(address _patient) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+        whenNotPaused 
+        returns (uint256 prunedCount) 
+    {
+        if (_patient == address(0)) revert InvalidAddress();
+        CompletedAppointments storage completed = patientCompletedAppointments[_patient];
+        if (completed.count == 0) revert NoAppointmentsToPrune();
+
+        // Count appointments to keep (recent or unresolved disputes)
+        uint256 keepCount = 0;
+        for (uint256 i = 0; i < completed.ids.length; i++) {
+            TelemedicineMedicalCore.Appointment memory apt = appointments[completed.ids[i]];
+            if (block.timestamp <= apt.scheduledTimestamp.add(recentAppointmentWindow) ||
+                apt.disputeOutcome == TelemedicineCore.DisputeOutcome.Unresolved) {
+                keepCount++;
+            }
+        }
+
+        if (keepCount == completed.count) revert NoAppointmentsToPrune();
+
+        // Create new array for kept appointments
+        uint256[] memory newIds = new uint256[](keepCount);
+        uint256 index = 0;
+        for (uint256 i = 0; i < completed.ids.length; i++) {
+            TelemedicineMedicalCore.Appointment memory apt = appointments[completed.ids[i]];
+            if (block.timestamp <= apt.scheduledTimestamp.add(recentAppointmentWindow) ||
+                apt.disputeOutcome == TelemedicineCore.DisputeOutcome.Unresolved) {
+                newIds[index] = completed.ids[i];
+                index++;
+            }
+        }
+
+        // Update mapping
+        prunedCount = completed.count.sub(keepCount);
+        completed.ids = newIds;
+        completed.count = keepCount;
+
+        emit OldAppointmentsPruned(_patient, prunedCount);
+        return prunedCount;
+    }
+
+    /// @notice Batch removes old completed appointments for multiple patients
+    /// @param _patients Array of patient addresses
+    /// @return totalPrunedCount Total number of appointments pruned across all patients
+    function batchRemoveOldCompletedAppointments(address[] calldata _patients)
+        external
+        onlyRole(core.ADMIN_ROLE())
+        whenNotPaused
+        returns (uint256 totalPrunedCount)
+    {
+        if (_patients.length == 0) revert InvalidParameter("No patients provided");
+        if (_patients.length > maxBatchSize) revert InvalidParameter("Exceeds max batch size");
+
+        for (uint256 i = 0; i < _patients.length; i++) {
+            address patient = _patients[i];
+            if (patient == address(0)) continue;
+
+            CompletedAppointments storage completed = patientCompletedAppointments[patient];
+            if (completed.count == 0) continue;
+
+            // Count appointments to keep
+            uint256 keepCount = 0;
+            for (uint256 j = 0; j < completed.ids.length; j++) {
+                TelemedicineMedicalCore.Appointment memory apt = appointments[completed.ids[j]];
+                if (block.timestamp <= apt.scheduledTimestamp.add(recentAppointmentWindow) ||
+                    apt.disputeOutcome == TelemedicineCore.DisputeOutcome.Unresolved) {
+                    keepCount++;
+                }
+            }
+
+            if (keepCount == completed.count) continue;
+
+            // Create new array for kept appointments
+            uint256[] memory newIds = new uint256[](keepCount);
+            uint256 index = 0;
+            for (uint256 j = 0; j < completed.ids.length; j++) {
+                TelemedicineMedicalCore.Appointment memory apt = appointments[completed.ids[j]];
+                if (block.timestamp <= apt.scheduledTimestamp.add(recentAppointmentWindow) ||
+                    apt.disputeOutcome == TelemedicineCore.DisputeOutcome.Unresolved) {
+                    newIds[index] = completed.ids[j];
+                    index++;
+                }
+            }
+
+            // Update mapping
+            uint256 prunedCount = completed.count.sub(keepCount);
+            completed.ids = newIds;
+            completed.count = keepCount;
+            totalPrunedCount = totalPrunedCount.add(prunedCount);
+
+            emit OldAppointmentsPruned(patient, prunedCount);
+        }
+
+        if (totalPrunedCount == 0) revert NoAppointmentsToPrune();
+        return totalPrunedCount;
+    }
+
+    /// @notice Retrieves unresolved disputed appointment IDs for a patient
+    /// @param _patient Patient address
+    /// @return Array of unresolved disputed appointment IDs
+    function getUnresolvedDisputedAppointments(address _patient) 
+        external 
+        view 
+        onlyRole(core.ADMIN_ROLE()) 
+        returns (uint256[] memory) 
+    {
+        if (_patient == address(0)) revert InvalidAddress();
+        CompletedAppointments storage completed = patientCompletedAppointments[_patient];
+        uint256[] memory disputedIds = new uint256[](completed.count);
+        uint256 count = 0;
+
+        for (uint256 i = 0; i < completed.ids.length; i++) {
+            Appointment memory apt = appointments[completed.ids[i]];
+            if (apt.disputeOutcome == TelemedicineCore.DisputeOutcome.Unresolved) {
+                disputedIds[count] = completed.ids[i];
+                count++;
+            }
+        }
+
+        uint256[] memory result = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = disputedIds[i];
+        }
+        return result;
+    }
+
+    /// @notice Checks if pruning is needed for a list of patients (for Chainlink Automation)
+    /// @param _patients Array of patient addresses
+    /// @return pruningNeeded Whether pruning is needed
+    /// @return patientsToPrune Array of patients needing pruning
+    function checkPruningNeeded(address[] calldata _patients)
+        external
+        view
+        returns (bool pruningNeeded, address[] memory patientsToPrune)
+    {
+        if (_patients.length == 0 || _patients.length > maxBatchSize) return (false, new address[](0));
+
+        address[] memory tempPatients = new address[](_patients.length);
+        uint256 count = 0;
+
+        for (uint256 i = 0; i < _patients.length; i++) {
+            address patient = _patients[i];
+            if (patient == address(0)) continue;
+
+            CompletedAppointments storage completed = patientCompletedAppointments[patient];
+            if (completed.count == 0) continue;
+
+            bool needsPruning = false;
+            for (uint256 j = 0; j < completed.ids.length; j++) {
+                Appointment memory apt = appointments[completed.ids[j]];
+                if (block.timestamp > apt.scheduledTimestamp.add(recentAppointmentWindow) &&
+                    apt.disputeOutcome != TelemedicineCore.DisputeOutcome.Unresolved) {
+                    needsPruning = true;
+                    break;
+                }
+            }
+
+            if (needsPruning) {
+                tempPatients[count] = patient;
+                count++;
+            }
+        }
+
+        if (count == 0) return (false, new address[](0));
+
+        patientsToPrune = new address[](count);
+        for (uint256 i = 0; i < count; i++) {
+            patientsToPrune[i] = tempPatients[i];
+        }
+        return (true, patientsToPrune);
     }
 
     /// @notice Orders a replacement prescription for a pharmacy dispute
@@ -276,6 +459,10 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
             completed.ids.push(_appointmentId);
             completed.count = completed.count.add(1);
             emit AppointmentCompleted(_appointmentId, apt.patient);
+            // Future: Add to patientDisputedAppointments if Disputed
+            // if (_status == AppointmentStatus.Disputed) {
+            //     patientDisputedAppointments[apt.patient].push(_appointmentId);
+            // }
         }
         apt.status = _status;
         apt.disputeOutcome = _disputeOutcome;
@@ -326,6 +513,9 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
         } else if (paramHash == keccak256(abi.encodePacked("maxBatchSize"))) {
             if (_value == 0 || _value > 100) revert InvalidParameter("Invalid batch size");
             maxBatchSize = _value;
+        } else if (paramHash == keccak256(abi.encodePacked("recentAppointmentWindow"))) {
+            if (_value < 1 days || _value > 30 days) revert InvalidParameter("Invalid appointment window");
+            recentAppointmentWindow = uint64(_value);
         } else {
             revert InvalidParameter("Unknown configuration parameter");
         }
@@ -353,7 +543,7 @@ contract TelemedicineMedicalCore is Initializable, UUPSUpgradeable, ReentrancyGu
     /// @notice Retrieves prescription details
     /// @param _prescriptionId Prescription ID
     /// @return Prescription struct
-    function getPrescription(uint256 _prescriptionId) external view returns (Prescription memory) {
+    function getPrescription(uint256 _prescriptionId) external view returns (Prescription struct) {
         if (_prescriptionId == 0 || _prescriptionId > prescriptionCounter) revert InvalidIndex();
         return prescriptions[_prescriptionId];
     }
