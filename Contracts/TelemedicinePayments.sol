@@ -15,8 +15,9 @@ import {TelemedicineOperations} from "./TelemedicineOperations.sol";
 import {ITelemedicinePayments} from "./Interfaces/ITelemedicinePayments.sol";
 
 /// @title TelemedicinePayments
-/// @notice Handles on-ramp, off-ramp, payment queuing, and patient refunds
-/// @dev UUPS upgradeable, integrates with TelemedicineCore, TelemedicineDisputeResolution, and TelemedicineOperations
+/// @notice Handles on-ramp, off-ramp, payment queuing, patient refunds, and reward validation
+/// @dev UUPS upgradeable, integrates with TelemedicineCore, DisputeResolution, and Operations
+/// @dev Optimized for Sonic Blockchain. Prices (bookings, lab tests, medications) in Sonic USDC (6 decimals); rewards in Sonic $S (18 decimals).
 contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
     using SafeMathUpgradeable for uint256;
     using SafeERC20Upgradeable for IERC20Upgradeable;
@@ -37,6 +38,8 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     error CounterOverflow();
     error InvalidInput();
     error InvalidConfiguration();
+    error InvalidRewardAmount(); // New: For $S reward validation
+    error InvalidRewardBounds(); // New: For reward bounds configuration
 
     // Constants
     uint256 public constant MIN_FEE_USD = 0.1 * 10**18; // 0.1 USD minimum (18 decimals)
@@ -51,8 +54,8 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     TelemedicineCore public immutable core;
     TelemedicineDisputeResolution public immutable disputeResolution;
     TelemedicineOperations public immutable operations;
-    IERC20Upgradeable public usdcToken;
-    IERC20Upgradeable public sonicToken;
+    IERC20Upgradeable public usdcToken; // Sonic USDC (6 decimals)
+    IERC20Upgradeable public sonicToken; // Sonic $S (18 decimals)
     AggregatorV3Interface public ethUsdPriceFeed;
     AggregatorV3Interface public sonicUsdPriceFeed;
     AggregatorV3Interface public usdFiatOracle;
@@ -66,7 +69,9 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     uint256 public offRampCounter;
     uint256 public pendingPaymentCounter;
     uint256 public versionNumber; // Track contract version
-    uint256 public maxFeeCapUsd; // Configurable max fee (USDC decimals)
+    uint256 public maxFeeCapUsd; // Configurable max fee (USDC decimals, 6)
+    uint256 public MIN_REWARD; // New: Min reward in Sonic $S (18 decimals)
+    uint256 public MAX_REWARD; // New: Max reward in Sonic $S (18 decimals)
 
     // Mappings
     mapping(uint256 => OnRampRequest) public onRampRequests;
@@ -81,7 +86,7 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         uint256 amount;
         ITelemedicinePayments.PaymentType paymentType;
         bool processed;
-        uint48 requestTimestamp; // Added for timeout tracking
+        uint48 requestTimestamp; // For timeout tracking
     }
 
     enum OnRampStatus { Pending, Fulfilled, Failed }
@@ -127,6 +132,7 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     event PendingPaymentCleaned(uint256 indexed paymentId, address recipient, uint256 amount);
     event ReserveFundAllocated(uint256 indexed operationId, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
     event PlatformFeeAllocated(uint256 indexed operationId, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
+    event RewardBoundsUpdated(uint256 newMinReward, uint256 newMaxReward); // New: Reward bounds update
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -134,6 +140,17 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     }
 
     /// @notice Initializes the contract
+    /// @param _core Address of TelemedicineCore contract
+    /// @param _usdcToken Address of Sonic USDC token (6 decimals)
+    /// @param _sonicToken Address of Sonic $S token (18 decimals)
+    /// @param _ethUsdPriceFeed Address of ETH/USD price feed
+    /// @param _sonicUsdPriceFeed Address of Sonic $S/USD price feed
+    /// @param _usdFiatOracle Address of USD/Fiat oracle
+    /// @param _onRampProvider Address of on-ramp provider
+    /// @param _offRampProvider Address of off-ramp provider
+    /// @param _disputeResolution Address of DisputeResolution contract
+    /// @param _operations Address of Operations contract
+    /// @param _multiSigWallet Address of multi-sig wallet
     function initialize(
         address _core,
         address _usdcToken,
@@ -175,6 +192,10 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         offRampFee = 2 * 10**18; // 2 USD (18 decimals)
         maxFeeCapUsd = 10 * 10**6; // 10 USDC (6 decimals)
         versionNumber = 1;
+        MIN_REWARD = 10_000_000_000_000_000; // 0.01 $S (10^16 units, 18 decimals)
+        MAX_REWARD = 1_000_000_000_000_000_000_000; // 1000 $S (10^21 units, 18 decimals)
+
+        emit RewardBoundsUpdated(MIN_REWARD, MAX_REWARD);
     }
 
     /// @notice Returns the contract version
@@ -189,7 +210,37 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         versionNumber++;
     }
 
+    /// @notice Returns the Sonic USDC token contract
+    function sonicToken() external view returns (IERC20Upgradeable) {
+        return usdcToken;
+    }
+
+    /// @notice Returns the Sonic $S token contract
+    function sonicNativeToken() external view returns (IERC20Upgradeable) {
+        return sonicToken;
+    }
+
+    /// @notice Updates the minimum and maximum reward bounds for Sonic $S payments
+    /// @param _newMinReward New minimum reward in Sonic $S units (18 decimals)
+    /// @param _newMaxReward New maximum reward in Sonic $S units (18 decimals)
+    /// @dev Restricted to ADMIN_ROLE; ensures min <= max and reasonable bounds
+    function updateRewardBounds(uint256 _newMinReward, uint256 _newMaxReward) 
+        external 
+        onlyRole(core.ADMIN_ROLE()) 
+    {
+        if (_newMinReward == 0 || _newMinReward > _newMaxReward) revert InvalidRewardBounds();
+        if (_newMaxReward > type(uint192).max) revert InvalidRewardBounds(); // Ensure fits in potential future storage
+
+        MIN_REWARD = _newMinReward;
+        MAX_REWARD = _newMaxReward;
+        emit RewardBoundsUpdated(_newMinReward, _newMaxReward);
+    }
+
     /// @notice Queues a payment
+    /// @param _recipient Recipient address
+    /// @param _amount Amount in token units (USDC: 6 decimals, $S: 18 decimals)
+    /// @param _paymentType Payment type (ETH, USDC, SONIC)
+    /// @dev Validates $S amounts against MIN_REWARD/MAX_REWARD
     function queuePayment(address _recipient, uint256 _amount, ITelemedicinePayments.PaymentType _paymentType)
         external
         nonReentrant
@@ -203,6 +254,9 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         if (_recipient == address(0)) revert InvalidAddress();
         if (_amount == 0) revert InsufficientFunds();
         if (pendingPaymentCounter >= MAX_PENDING_PAYMENTS) revert CounterOverflow();
+        if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+            if (_amount < MIN_REWARD || _amount > MAX_REWARD) revert InvalidRewardAmount();
+        }
 
         pendingPaymentCounter = pendingPaymentCounter.add(1);
         pendingPayments[pendingPaymentCounter] = PendingPayment(_recipient, _amount, _paymentType, false, uint48(block.timestamp));
@@ -210,6 +264,9 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     }
 
     /// @notice Requests an on-ramp operation
+    /// @param _fiatAmount Fiat amount (USD, 18 decimals)
+    /// @param _targetToken Target token (ETH, USDC, SONIC)
+    /// @param _providerReference Provider reference hash
     function requestOnRamp(uint256 _fiatAmount, ITelemedicinePayments.PaymentType _targetToken, bytes32 _providerReference)
         external
         payable
@@ -278,6 +335,9 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     }
 
     /// @notice Requests an off-ramp operation
+    /// @param _sourceToken Source token (ETH, USDC, SONIC)
+    /// @param _cryptoAmount Amount in token units
+    /// @param _bankDetails Bank details hash
     function requestOffRamp(ITelemedicinePayments.PaymentType _sourceToken, uint256 _cryptoAmount, bytes32 _bankDetails)
         external
         payable
@@ -420,7 +480,9 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         }
     }
 
-    /// @notice Processes a payment
+    /// @notice Processes a payment with reserve and platform fee allocation
+    /// @param _type Payment type (ETH, USDC, SONIC)
+    /// @param _amount Amount in token units
     function _processPayment(ITelemedicinePayments.PaymentType _type, uint256 _amount)
         external
         payable
@@ -428,6 +490,9 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         whenNotPaused
     {
         if (msg.sender != address(operations)) revert NotAuthorized();
+        if (_type == ITelemedicinePayments.PaymentType.SONIC) {
+            if (_amount < MIN_REWARD || _amount > MAX_REWARD) revert InvalidRewardAmount();
+        }
 
         uint256 reservePercentage = core.reserveFundPercentage();
         uint256 platformPercentage = core.platformFeePercentage();
@@ -482,7 +547,7 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         emit PlatformFeeAllocated(operationId, platformAmount, _type);
     }
 
-    /// @notice Refunds a patient
+    /// @notice Refunds a patient from reserve funds
     function _refundPatient(address _patient, uint256 _amount, ITelemedicinePayments.PaymentType _type)
         public
         onlyDisputeResolution
@@ -500,6 +565,8 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     }
 
     /// @notice Releases queued payments
+    /// @param _startId Starting payment ID
+    /// @param _endId Ending payment ID
     function releasePendingPayments(uint256 _startId, uint256 _endId)
         external
         onlyRole(core.ADMIN_ROLE())
@@ -512,6 +579,9 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         for (uint256 i = _startId; i <= _endId; i++) {
             PendingPayment storage payment = pendingPayments[i];
             if (payment.processed || payment.amount == 0) continue;
+            if (payment.paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+                if (payment.amount < MIN_REWARD || payment.amount > MAX_REWARD) revert InvalidRewardAmount();
+            }
 
             if (_hasSufficientFunds(payment.amount, payment.paymentType)) {
                 _releasePayment(payment.recipient, payment.amount, payment.paymentType);
@@ -552,7 +622,7 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         bool usdStale = usdPrice <= 0 || block.timestamp > updatedAt + MAX_STALENESS;
         uint256 fiatInUsd = usdStale ? _fiatAmount : _fiatAmount.mul(uint256(usdPrice)).div(10**usdFiatOracle.decimals());
 
-        if (_targetToken == ITelemedicinePayments.PaymentType.ETH) {
+        if Moderation if (_targetToken == ITelemedicinePayments.PaymentType.ETH) {
             (, int256 ethPrice, , uint256 ethUpdatedAt, ) = ethUsdPriceFeed.latestRoundData();
             if (ethPrice <= 0 || block.timestamp > ethUpdatedAt + MAX_STALENESS) {
                 if (usdStale) revert OracleFailure();
@@ -656,6 +726,9 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
         if (!_hasSufficientFunds(_amount, _paymentType)) {
             if (pendingPaymentCounter >= MAX_PENDING_PAYMENTS) revert CounterOverflow();
             pendingPaymentCounter = pendingPaymentCounter.add(1);
+            if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+                if (_amount < MIN_REWARD || _amount > MAX_REWARD) revert InvalidRewardAmount();
+            }
             pendingPayments[pendingPaymentCounter] = PendingPayment(_to, _amount, _paymentType, false, uint48(block.timestamp));
             emit PaymentQueued(pendingPaymentCounter, _to, _amount, _paymentType);
             return;
@@ -668,6 +741,7 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
                 revert ExternalCallFailed();
             }
         } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+            if (_amount < MIN_REWARD || _amount > MAX_REWARD) revert InvalidRewardAmount();
             try sonicToken.safeTransfer(_to, _amount) {} catch {
                 revert ExternalCallFailed();
             }
@@ -784,5 +858,5 @@ contract TelemedicinePayments is Initializable, UUPSUpgradeable, ReentrancyGuard
     receive() external payable {}
 
     // Storage gap
-    uint256[50] private __gap;
+    uint256[48] private __gap; // Reduced from 50 due to MIN_REWARD, MAX_REWARD
 }
