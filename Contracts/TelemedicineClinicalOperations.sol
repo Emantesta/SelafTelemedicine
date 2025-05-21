@@ -11,10 +11,11 @@ import {TelemedicinePayments} from "./TelemedicinePayments.sol";
 import {TelemedicineDisputeResolution} from "./TelemedicineDisputeResolution.sol";
 import {TelemedicineBase} from "./TelemedicineBase.sol";
 import {TelemedicinePaymentOperations} from "./TelemedicinePaymentOperations.sol";
+import {TelemedicineMedicalCore} from "./TelemedicineMedicalCore.sol";
 
 /// @title TelemedicineClinicalOperations
-/// @notice Manages lab tests, prescriptions, and AI symptom analysis
-/// @dev Upgradeable, integrates with core, payments, dispute resolution, base, and payment ops
+/// @notice Manages lab tests, prescriptions, and AI symptom analysis for a telemedicine platform
+/// @dev Upgradeable, integrates with core, payments, dispute resolution, base, payment operations, and medical core
 contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgradeable, PausableUpgradeable {
     using SafeMathUpgradeable for uint256;
     using SafeERC20Upgradeable for IERC20Upgradeable;
@@ -25,70 +26,77 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
     TelemedicineDisputeResolution public immutable disputeResolution;
     TelemedicineBase public immutable base;
     TelemedicinePaymentOperations public immutable paymentOps;
+    TelemedicineMedicalCore public immutable medicalCore; // Updated: Direct access to TelemedicineMedicalCore
 
     // Private State Variables
-    mapping(uint256 => LabTestOrder) private labTestOrders; // Updated: Private
-    mapping(uint256 => Prescription) private prescriptions; // Updated: Private
-    mapping(uint256 => AISymptomAnalysis) private aiAnalyses; // Updated: Private
+    mapping(uint256 => LabTestOrder) private labTestOrders;
+    mapping(uint256 => Prescription) private prescriptions;
+    mapping(uint256 => AISymptomAnalysis) private aiAnalyses;
     uint256 private labTestCounter;
     uint256 private prescriptionCounter;
     uint256 private aiAnalysisCounter;
 
     // Constants
-    uint256 public constant MAX_COUNTER = 1_000_000; // New: Counter limit
-    uint256 public constant MAX_STRING_LENGTH = 256; // New: String length limit
-    uint64 public constant MIN_SAMPLE_DEADLINE = 1 hours; // New: Minimum sample deadline
-    uint64 public constant MIN_RESULTS_DEADLINE = 1 days; // New: Minimum results deadline
-    uint64 public constant MAX_DISPUTE_WINDOW = 7 days; // New: Maximum dispute window
-    bytes32 private immutable SALT; // New: For verification code
+    uint256 public constant MAX_COUNTER = 1_000_000;
+    uint256 public constant MAX_STRING_LENGTH = 256;
+    uint64 public constant MIN_SAMPLE_DEADLINE = 1 hours;
+    uint64 public constant MIN_RESULTS_DEADLINE = 1 days;
+    uint64 public constant MAX_DISPUTE_WINDOW = 7 days;
+    uint64 public constant REVIEW_DEADLINE = 15 minutes; // Deadline for AI analysis review
+    uint64 public constant RECENT_APPOINTMENT_WINDOW = 7 days; // Window for recent appointments
+    bytes32 private immutable SALT;
 
     // Enums
     enum LabTestStatus { Requested, PaymentPending, Collected, ResultsUploaded, Reviewed, Disputed, Expired }
     enum PrescriptionStatus { Generated, PaymentPending, Verified, Fulfilled, Revoked, Expired, Disputed }
-    enum DisputeOutcome { Unresolved, PatientFavored, ProviderFavored, MutualAgreement } // Assumed compatible with TelemedicineDisputeResolution
+    enum DisputeOutcome { Unresolved, PatientFavored, ProviderFavored, MutualAgreement }
+    enum AISymptomAnalysisStatus { Pending, Reviewed, Expired }
 
     // Structs
     struct LabTestOrder {
-        uint32 id; // Updated: uint32
+        uint32 id;
         address patient;
         address doctor;
         address labTech;
         LabTestStatus status;
-        uint64 orderedTimestamp; // Updated: uint64
-        uint64 completedTimestamp; // Updated: uint64
-        bytes32 testTypeHash; // Updated: Hashed
-        bytes32 sampleCollectionHash; // Updated: Hashed
-        bytes32 resultsHash; // Updated: Hashed
+        uint64 orderedTimestamp;
+        uint64 completedTimestamp;
+        bytes32 testTypeHash;
+        bytes32 sampleCollectionHash;
+        bytes32 resultsHash;
         uint256 patientCost;
-        uint64 disputeWindowEnd; // Updated: uint64
+        uint64 disputeWindowEnd;
         DisputeOutcome disputeOutcome;
-        uint64 sampleCollectionDeadline; // Updated: uint64
-        uint64 resultsUploadDeadline; // Updated: uint64
+        uint64 sampleCollectionDeadline;
+        uint64 resultsUploadDeadline;
         TelemedicinePayments.PaymentType paymentType;
     }
 
     struct Prescription {
-        uint32 id; // Updated: uint32
+        uint32 id;
         address patient;
         address doctor;
         bytes32 verificationCodeHash;
         PrescriptionStatus status;
         address pharmacy;
-        uint64 generatedTimestamp; // Updated: uint64
-        uint64 expirationTimestamp; // Updated: uint64
-        bytes32 medicationHash; // Updated: Hashed
-        bytes32 prescriptionHash; // Updated: Hashed
+        uint64 generatedTimestamp;
+        uint64 expirationTimestamp;
+        bytes32 medicationHash;
+        bytes32 prescriptionHash;
         uint256 patientCost;
-        uint64 disputeWindowEnd; // Updated: uint64
+        uint64 disputeWindowEnd;
         DisputeOutcome disputeOutcome;
     }
 
     struct AISymptomAnalysis {
-        uint32 id; // Updated: uint32
+        uint32 id;
         address patient;
         bool doctorReviewed;
-        bytes32 symptomsHash; // Updated: Hashed
-        bytes32 analysisHash; // Updated: Hashed
+        AISymptomAnalysisStatus status;
+        bytes32 symptomsHash;
+        bytes32 analysisHash;
+        uint64 reviewDeadline;
+        uint96 pointsEarned;
     }
 
     // Custom Errors
@@ -109,6 +117,8 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
     error InvalidDeadline();
     error InvalidOutcome();
     error InvalidPaymentStatus();
+    error AnalysisNotReviewed();
+    error NoRecentAppointment();
 
     // Events
     event LabTestOrdered(uint32 indexed testId, bytes32 indexed patientHash, bytes32 indexed doctorHash, bytes32 testTypeHash, uint64 orderedAt);
@@ -121,35 +131,42 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
     event PrescriptionFulfilled(uint32 indexed prescriptionId);
     event PrescriptionExpired(uint32 indexed prescriptionId);
     event AISymptomAnalyzed(uint32 indexed id, bytes32 indexed patientHash);
+    event AISymptomAnalysisReviewed(uint32 indexed id, bytes32 indexed patientHash, bytes32 analysisHash);
+    event AISymptomAnalysisExpired(uint32 indexed id, bytes32 indexed patientHash, uint96 pointsRefunded);
     event PrescriptionDetailsSet(uint32 indexed prescriptionId, bytes32 prescriptionHash);
     event LabTestDisputeWindowStarted(uint32 indexed testId, bytes32 patientHash, uint64 disputeWindowEnd);
     event PrescriptionDisputeWindowStarted(uint32 indexed prescriptionId, bytes32 patientHash, uint64 disputeWindowEnd);
     event ReplacementPrescriptionOrdered(uint32 indexed originalPrescriptionId, uint32 indexed newPrescriptionId);
-    event DisputeOutcomeUpdated(uint32 indexed id, DisputeOutcome outcome); // New: Dispute outcome update
+    event DisputeOutcomeUpdated(uint32 indexed id, DisputeOutcome outcome);
+    event LabTestRefunded(uint32 indexed testId, address patient, uint256 amount);
+    event LabTestPaymentConfirmed(uint32 indexed testId, uint256 amount);
+    event PrescriptionPaymentConfirmed(uint32 indexed prescriptionId, uint256 amount);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
-        SALT = keccak256(abi.encode(block.chainid, address(this))); // New: Immutable salt
+        SALT = keccak256(abi.encode(block.chainid, address(this)));
     }
 
-    /// @notice Initializes the contract
+    /// @notice Initializes the contract with dependencies
     /// @param _core Core contract address
     /// @param _payments Payments contract address
     /// @param _disputeResolution Dispute resolution contract address
     /// @param _base Base contract address
     /// @param _paymentOps Payment operations contract address
+    /// @param _medicalCore Medical core contract address
     function initialize(
         address _core,
         address _payments,
         address _disputeResolution,
         address _base,
-        address _paymentOps
+        address _paymentOps,
+        address _medicalCore
     ) external initializer {
         if (_core == address(0) || _payments == address(0) || _disputeResolution == address(0) ||
-            _base == address(0) || _paymentOps == address(0)) revert InvalidAddress();
+            _base == address(0) || _paymentOps == address(0) || _medicalCore == address(0)) revert InvalidAddress();
         if (!_isContract(_core) || !_isContract(_payments) || !_isContract(_disputeResolution) ||
-            !_isContract(_base) || !_isContract(_paymentOps)) revert InvalidAddress();
+            !_isContract(_base) || !_isContract(_paymentOps) || !_isContract(_medicalCore)) revert InvalidAddress();
 
         __ReentrancyGuard_init();
         __Pausable_init();
@@ -159,48 +176,31 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
         base = TelemedicineBase(_base);
         paymentOps = TelemedicinePaymentOperations(_paymentOps);
+        medicalCore = TelemedicineMedicalCore(_medicalCore);
     }
 
     // Lab Test Management
 
-    /// @notice Orders a lab test
+    /// @notice Orders a lab test for a patient
     /// @param _patient Patient address
-    /// @param _testTypeIpfsHash Test type IPFS hash
-    /// @param _locality Locality
+    /// @param _testTypeIpfsHash IPFS hash of test type
+    /// @param _locality Locality for lab tech selection
     function orderLabTest(address _patient, string calldata _testTypeIpfsHash, string calldata _locality)
         external payable onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused {
         if (_patient == address(0)) revert InvalidAddress();
         if (bytes(_testTypeIpfsHash).length > MAX_STRING_LENGTH || bytes(_locality).length > MAX_STRING_LENGTH) revert InvalidParameter();
         if (labTestCounter >= MAX_COUNTER) revert InvalidCounter();
-        try core.patients(_patient) returns (TelemedicineCore.Patient memory patient) {
-            if (!patient.isRegistered) revert NotAuthorized();
-        } catch {
-            revert ExternalCallFailed();
-        }
 
-        address selectedLabTech;
-        try paymentOps.selectBestLabTech(_testTypeIpfsHash, _locality) returns (address labTech) {
-            selectedLabTech = labTech;
-        } catch {
-            revert ExternalCallFailed();
-        }
+        TelemedicineCore.Patient memory patient = core.patients(_patient);
+        if (!patient.isRegistered) revert NotAuthorized();
+
+        address selectedLabTech = paymentOps.selectBestLabTech(_testTypeIpfsHash, _locality);
         if (selectedLabTech == address(0)) revert NoLabTechAvailable();
 
-        uint256 price;
-        bool isValid;
-        uint64 sampleDeadline;
-        uint64 resultsDeadline;
-        try paymentOps.getLabTestDetails(selectedLabTech, _testTypeIpfsHash) returns (uint256 p, bool v, uint48 s, uint48 r) {
-            price = p;
-            isValid = v;
-            sampleDeadline = uint64(s);
-            resultsDeadline = uint64(r);
-        } catch {
-            revert ExternalCallFailed();
-        }
+        (uint256 price, bool isValid, uint48 sampleDeadline, uint48 resultsDeadline) = paymentOps.getLabTestDetails(selectedLabTech, _testTypeIpfsHash);
         if (sampleDeadline < MIN_SAMPLE_DEADLINE || resultsDeadline < MIN_RESULTS_DEADLINE) revert InvalidDeadline();
 
-        labTestCounter = labTestCounter.add(1);
+        unchecked { labTestCounter++; }
         uint32 newTestId = uint32(labTestCounter);
         LabTestOrder storage order = labTestOrders[newTestId];
         order.id = newTestId;
@@ -210,41 +210,29 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         order.status = LabTestStatus.Requested;
         order.orderedTimestamp = uint64(block.timestamp);
         order.testTypeHash = keccak256(abi.encode(_testTypeIpfsHash));
-        order.sampleCollectionDeadline = sampleDeadline;
-        order.resultsUploadDeadline = resultsDeadline;
+        order.sampleCollectionDeadline = uint64(sampleDeadline);
+        order.resultsUploadDeadline = uint64(resultsDeadline);
         order.paymentType = TelemedicinePayments.PaymentType.ETH;
 
         if (!isValid || price == 0) {
-            try paymentOps.requestLabTestPrice(selectedLabTech, _testTypeIpfsHash, newTestId) {} catch {
-                revert ExternalCallFailed();
-            }
+            paymentOps.requestLabTestPrice(selectedLabTech, _testTypeIpfsHash, newTestId);
         } else {
-            uint256 percentageDenominator;
-            try base.PERCENTAGE_DENOMINATOR() returns (uint256 denom) {
-                percentageDenominator = denom;
-            } catch {
-                revert ExternalCallFailed();
-            }
+            uint256 percentageDenominator = base.PERCENTAGE_DENOMINATOR();
             order.patientCost = price.mul(120).div(percentageDenominator);
             if (msg.value < order.patientCost) revert InsufficientFunds();
-            try paymentOps.setLabTestPayment(newTestId, true) {} catch {
-                revert ExternalCallFailed();
-            }
+            paymentOps.setLabTestPayment(newTestId, true);
             if (msg.value > order.patientCost) {
-                uint256 refund = msg.value.sub(order.patientCost);
-                _safeRefund(msg.sender, refund);
+                _safeRefund(msg.sender, msg.value.sub(order.patientCost));
             }
         }
 
         emit LabTestOrdered(newTestId, keccak256(abi.encode(_patient)), keccak256(abi.encode(msg.sender)), order.testTypeHash, order.orderedTimestamp);
-        try paymentOps.monetizeData(_patient) {} catch {
-            // Non-critical, continue
-        }
+        try paymentOps.monetizeData(_patient) {} catch {}
     }
 
-    /// @notice Collects lab test sample
+    /// @notice Collects a lab test sample
     /// @param _labTestId Lab test ID
-    /// @param _ipfsHash Sample collection IPFS hash
+    /// @param _ipfsHash IPFS hash of sample collection details
     function collectSample(uint32 _labTestId, string calldata _ipfsHash)
         external onlyRole(core.LAB_TECH_ROLE()) nonReentrant whenNotPaused {
         if (_labTestId == 0 || _labTestId > labTestCounter) revert InvalidId();
@@ -253,13 +241,7 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         if (order.status != LabTestStatus.Requested) revert InvalidStatus();
         if (order.labTech != msg.sender) revert NotAuthorized();
         if (block.timestamp > order.orderedTimestamp.add(order.sampleCollectionDeadline)) revert DeadlineMissed();
-        bool paid;
-        try paymentOps.getLabTestPaymentStatus(_labTestId) returns (bool status) {
-            paid = status;
-        } catch {
-            revert ExternalCallFailed();
-        }
-        if (!paid) revert PaymentNotConfirmed();
+        if (!paymentOps.getLabTestPaymentStatus(_labTestId)) revert PaymentNotConfirmed();
 
         order.sampleCollectionHash = keccak256(abi.encode(_ipfsHash));
         order.status = LabTestStatus.Collected;
@@ -268,7 +250,7 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
 
     /// @notice Uploads lab test results
     /// @param _labTestId Lab test ID
-    /// @param _resultsIpfsHash Results IPFS hash
+    /// @param _resultsIpfsHash IPFS hash of results
     function uploadLabResults(uint32 _labTestId, string calldata _resultsIpfsHash)
         external onlyRole(core.LAB_TECH_ROLE()) nonReentrant whenNotPaused {
         if (_labTestId == 0 || _labTestId > labTestCounter) revert InvalidId();
@@ -277,33 +259,20 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         if (order.labTech != msg.sender) revert NotAuthorized();
         if (order.status != LabTestStatus.Collected) revert InvalidStatus();
         if (block.timestamp > order.orderedTimestamp.add(order.resultsUploadDeadline)) revert DeadlineMissed();
-        bool paid;
-        try paymentOps.getLabTestPaymentStatus(_labTestId) returns (bool status) {
-            paid = status;
-        } catch {
-            revert ExternalCallFailed();
-        }
-        if (!paid) revert PaymentNotConfirmed();
+        if (!paymentOps.getLabTestPaymentStatus(_labTestId)) revert PaymentNotConfirmed();
 
         order.resultsHash = keccak256(abi.encode(_resultsIpfsHash));
         order.status = LabTestStatus.ResultsUploaded;
-        uint64 disputeWindow;
-        try base.disputeWindow() returns (uint256 window) {
-            disputeWindow = uint64(window);
-        } catch {
-            revert ExternalCallFailed();
-        }
+        uint64 disputeWindow = uint64(base.disputeWindow());
         if (disputeWindow > MAX_DISPUTE_WINDOW) revert InvalidParameter();
         order.disputeWindowEnd = uint64(block.timestamp).add(disputeWindow);
         emit LabTestUploaded(_labTestId, order.resultsHash);
         emit LabTestDisputeWindowStarted(_labTestId, keccak256(abi.encode(order.patient)), order.disputeWindowEnd);
-        try paymentOps.monetizeData(order.patient) {} catch {
-            // Non-critical, continue
-        }
+        try paymentOps.monetizeData(order.patient) {} catch {}
     }
 
-    /// @notice Checks deadlines for multiple lab tests
-    /// @param _labTestIds Lab test IDs
+    /// @notice Checks deadlines for multiple lab tests and reorders if necessary
+    /// @param _labTestIds Array of lab test IDs
     function batchCheckLabTestDeadlines(uint32[] calldata _labTestIds) external nonReentrant whenNotPaused {
         for (uint256 i = 0; i < _labTestIds.length; i++) {
             uint32 _labTestId = _labTestIds[i];
@@ -316,70 +285,28 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
                 missedDeadline = true;
             } else if (order.status == LabTestStatus.Collected && block.timestamp > order.orderedTimestamp.add(order.resultsUploadDeadline)) {
                 missedDeadline = true;
-            } else if (order.status == LabTestStatus.PaymentPending) {
-                uint64 deadline;
-                try paymentOps.getLabTestPaymentDeadline(_labTestId) returns (uint256 d) {
-                    deadline = uint64(d);
-                } catch {
-                    continue;
-                }
-                if (block.timestamp > deadline) missedDeadline = true;
+            } else if (order.status == LabTestStatus.PaymentPending && block.timestamp > paymentOps.getLabTestPaymentDeadline(_labTestId)) {
+                missedDeadline = true;
             }
 
             if (missedDeadline) {
-                string memory locality;
-                try paymentOps.getLabTechLocality(order.labTech) returns (string memory loc) {
-                    locality = loc;
-                } catch {
-                    continue;
-                }
-                address newLabTech;
-                try paymentOps.selectBestLabTech(string(abi.encode(order.testTypeHash)), locality) returns (address labTech) {
-                    newLabTech = labTech;
-                } catch {
-                    continue;
-                }
+                string memory locality = paymentOps.getLabTechLocality(order.labTech);
+                address newLabTech = paymentOps.selectBestLabTech(string(abi.encode(order.testTypeHash)), locality);
                 if (newLabTech == order.labTech || newLabTech == address(0)) continue;
 
-                uint256 price;
-                bool isValid;
-                uint64 sampleDeadline;
-                uint64 resultsDeadline;
-                try paymentOps.getLabTestDetails(newLabTech, string(abi.encode(order.testTypeHash))) returns (uint256 p, bool v, uint48 s, uint48 r) {
-                    price = p;
-                    isValid = v;
-                    sampleDeadline = uint64(s);
-                    resultsDeadline = uint64(r);
-                } catch {
-                    continue;
-                }
+                (uint256 price, bool isValid, uint48 sampleDeadline, uint48 resultsDeadline) = paymentOps.getLabTestDetails(newLabTech, string(abi.encode(order.testTypeHash)));
                 if (!isValid) continue;
 
-                if (order.patientCost > 0) {
-                    bool paid;
-                    try paymentOps.getLabTestPaymentStatus(_labTestId) returns (bool status) {
-                        paid = status;
-                    } catch {
-                        continue;
-                    }
-                    if (paid) {
-                        try payments._refundPatient(order.patient, order.patientCost, order.paymentType) {} catch {
-                            continue;
-                        }
-                        emit LabTestRefunded(_labTestId, order.patient, order.patientCost);
-                    }
+                if (order.patientCost > 0 && paymentOps.getLabTestPaymentStatus(_labTestId)) {
+                    payments._refundPatient(order.patient, order.patientCost, order.paymentType);
+                    emit LabTestRefunded(_labTestId, order.patient, order.patientCost);
                 }
 
                 order.status = LabTestStatus.Expired;
-                labTestCounter = labTestCounter.add(1);
+                unchecked { labTestCounter++; }
                 if (labTestCounter >= MAX_COUNTER) continue;
                 uint32 newTestId = uint32(labTestCounter);
-                uint256 percentageDenominator;
-                try base.PERCENTAGE_DENOMINATOR() returns (uint256 denom) {
-                    percentageDenominator = denom;
-                } catch {
-                    continue;
-                }
+                uint256 percentageDenominator = base.PERCENTAGE_DENOMINATOR();
                 uint256 patientCost = price.mul(120).div(percentageDenominator);
 
                 labTestOrders[newTestId] = LabTestOrder({
@@ -396,37 +323,31 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
                     patientCost: patientCost,
                     disputeWindowEnd: 0,
                     disputeOutcome: DisputeOutcome.Unresolved,
-                    sampleCollectionDeadline: sampleDeadline,
-                    resultsUploadDeadline: resultsDeadline,
+                    sampleCollectionDeadline: uint64(sampleDeadline),
+                    resultsUploadDeadline: uint64(resultsDeadline),
                     paymentType: order.paymentType
                 });
 
                 if (!isValid || price == 0) {
-                    try paymentOps.requestLabTestPrice(newLabTech, string(abi.encode(order.testTypeHash)), newTestId) {} catch {
-                        continue;
-                    }
+                    paymentOps.requestLabTestPrice(newLabTech, string(abi.encode(order.testTypeHash)), newTestId);
                 } else {
-                    try paymentOps.setLabTestPayment(newTestId, true) {} catch {
-                        continue;
-                    }
+                    paymentOps.setLabTestPayment(newTestId, true);
                     emit LabTestPaymentConfirmed(newTestId, patientCost);
                 }
 
                 emit LabTestOrdered(newTestId, keccak256(abi.encode(order.patient)), keccak256(abi.encode(order.doctor)), order.testTypeHash, uint64(block.timestamp));
                 emit LabTestReordered(_labTestId, newTestId, keccak256(abi.encode(newLabTech)), keccak256(abi.encode(order.patient)));
-                try paymentOps.monetizeData(order.patient) {} catch {
-                    // Non-critical, continue
-                }
+                try paymentOps.monetizeData(order.patient) {} catch {}
             }
         }
     }
 
-    /// @notice Reviews lab results and issues prescription
+    /// @notice Reviews lab results and issues a prescription
     /// @param _labTestId Lab test ID
-    /// @param _medicationIpfsHash Medication IPFS hash
-    /// @param _prescriptionIpfsHash Prescription IPFS hash
+    /// @param _medicationIpfsHash IPFS hash of medication
+    /// @param _prescriptionIpfsHash IPFS hash of prescription
     /// @param _pharmacy Pharmacy address
-    /// @param _locality Locality
+    /// @param _locality Locality for pharmacy validation
     function reviewLabResults(uint32 _labTestId, string calldata _medicationIpfsHash, string calldata _prescriptionIpfsHash, address _pharmacy, string calldata _locality)
         external payable onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused {
         if (_labTestId == 0 || _labTestId > labTestCounter) revert InvalidId();
@@ -435,34 +356,15 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         LabTestOrder storage order = labTestOrders[_labTestId];
         if (order.doctor != msg.sender) revert NotAuthorized();
         if (order.status != LabTestStatus.ResultsUploaded) revert InvalidStatus();
-        bool isPharmacyValid;
-        try paymentOps.isPharmacyRegistered(_pharmacy) returns (bool registered) {
-            isPharmacyValid = registered;
-        } catch {
-            revert ExternalCallFailed();
-        }
-        if (!isPharmacyValid) {
-            try paymentOps.hasPharmacyInLocality(_locality) returns (bool hasPharmacy) {
-                isPharmacyValid = hasPharmacy;
-            } catch {
-                revert ExternalCallFailed();
-            }
-        }
+        bool isPharmacyValid = paymentOps.isPharmacyRegistered(_pharmacy) || paymentOps.hasPharmacyInLocality(_locality);
         if (!isPharmacyValid) revert NotAuthorized();
 
-        uint256 price;
-        bool isValid;
-        try paymentOps.getPharmacyPrice(_pharmacy, _medicationIpfsHash) returns (uint256 p, bool v) {
-            price = p;
-            isValid = v;
-        } catch {
-            revert ExternalCallFailed();
-        }
+        (uint256 price, bool isValid) = paymentOps.getPharmacyPrice(_pharmacy, _medicationIpfsHash);
 
         order.status = LabTestStatus.Reviewed;
         order.completedTimestamp = uint64(block.timestamp);
 
-        prescriptionCounter = prescriptionCounter.add(1);
+        unchecked { prescriptionCounter++; }
         if (prescriptionCounter >= MAX_COUNTER) revert InvalidCounter();
         uint32 newPrescriptionId = uint32(prescriptionCounter);
         bytes32 verificationCodeHash = keccak256(abi.encodePacked(newPrescriptionId, msg.sender, block.timestamp, SALT));
@@ -479,38 +381,26 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         prescription.medicationHash = keccak256(abi.encode(_medicationIpfsHash));
 
         if (!isValid || price == 0) {
-            try paymentOps.requestPrescriptionPrice(_pharmacy, _medicationIpfsHash, newPrescriptionId) {} catch {
-                revert ExternalCallFailed();
-            }
+            paymentOps.requestPrescriptionPrice(_pharmacy, _medicationIpfsHash, newPrescriptionId);
         } else {
-            uint256 percentageDenominator;
-            try base.PERCENTAGE_DENOMINATOR() returns (uint256 denom) {
-                percentageDenominator = denom;
-            } catch {
-                revert ExternalCallFailed();
-            }
+            uint256 percentageDenominator = base.PERCENTAGE_DENOMINATOR();
             prescription.patientCost = price.mul(120).div(percentageDenominator);
             if (msg.value < prescription.patientCost) revert InsufficientFunds();
             prescription.prescriptionHash = keccak256(abi.encode(_prescriptionIpfsHash));
-            try paymentOps.setPrescriptionPayment(newPrescriptionId, true) {} catch {
-                revert ExternalCallFailed();
-            }
+            paymentOps.setPrescriptionPayment(newPrescriptionId, true);
             emit PrescriptionPaymentConfirmed(newPrescriptionId, prescription.patientCost);
             if (msg.value > prescription.patientCost) {
-                uint256 refund = msg.value.sub(prescription.patientCost);
-                _safeRefund(msg.sender, refund);
+                _safeRefund(msg.sender, msg.value.sub(prescription.patientCost));
             }
         }
 
         emit PrescriptionIssued(newPrescriptionId, keccak256(abi.encode(order.patient)), keccak256(abi.encode(msg.sender)), verificationCodeHash, uint64(block.timestamp));
-        try paymentOps.monetizeData(order.patient) {} catch {
-            // Non-critical, continue
-        }
+        try paymentOps.monetizeData(order.patient) {} catch {}
     }
 
-    /// @notice Sets prescription details
+    /// @notice Sets prescription details by patient
     /// @param _prescriptionId Prescription ID
-    /// @param _prescriptionIpfsHash Prescription IPFS hash
+    /// @param _prescriptionIpfsHash IPFS hash of prescription
     function setPrescriptionDetails(uint32 _prescriptionId, string calldata _prescriptionIpfsHash)
         external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
         if (_prescriptionId == 0 || _prescriptionId > prescriptionCounter) revert InvalidId();
@@ -518,13 +408,7 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         Prescription storage prescription = prescriptions[_prescriptionId];
         if (prescription.patient != msg.sender) revert NotAuthorized();
         if (prescription.status != PrescriptionStatus.Generated) revert InvalidStatus();
-        bool paid;
-        try paymentOps.getPrescriptionPaymentStatus(_prescriptionId) returns (bool status) {
-            paid = status;
-        } catch {
-            revert ExternalCallFailed();
-        }
-        if (!paid) revert PaymentNotConfirmed();
+        if (!paymentOps.getPrescriptionPaymentStatus(_prescriptionId)) revert PaymentNotConfirmed();
         if (prescription.prescriptionHash != bytes32(0)) revert InvalidStatus();
 
         prescription.prescriptionHash = keccak256(abi.encode(_prescriptionIpfsHash));
@@ -532,7 +416,7 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
     }
 
     /// @notice Checks deadlines for multiple prescriptions
-    /// @param _prescriptionIds Prescription IDs
+    /// @param _prescriptionIds Array of prescription IDs
     function batchCheckPrescriptionDeadlines(uint32[] calldata _prescriptionIds) external nonReentrant whenNotPaused {
         for (uint256 i = 0; i < _prescriptionIds.length; i++) {
             uint32 _prescriptionId = _prescriptionIds[i];
@@ -543,17 +427,9 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
                 prescription.status == PrescriptionStatus.Expired ||
                 prescription.status == PrescriptionStatus.Disputed) continue;
 
-            if (prescription.status == PrescriptionStatus.PaymentPending) {
-                uint64 deadline;
-                try paymentOps.getPrescriptionPaymentDeadline(_prescriptionId) returns (uint256 d) {
-                    deadline = uint64(d);
-                } catch {
-                    continue;
-                }
-                if (block.timestamp > deadline) {
-                    prescription.status = PrescriptionStatus.Expired;
-                    emit PrescriptionExpired(_prescriptionId);
-                }
+            if (prescription.status == PrescriptionStatus.PaymentPending && block.timestamp > paymentOps.getPrescriptionPaymentDeadline(_prescriptionId)) {
+                prescription.status = PrescriptionStatus.Expired;
+                emit PrescriptionExpired(_prescriptionId);
             } else if ((prescription.status == PrescriptionStatus.Generated || prescription.status == PrescriptionStatus.Verified) &&
                        block.timestamp > prescription.expirationTimestamp) {
                 prescription.status = PrescriptionStatus.Expired;
@@ -562,7 +438,7 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         }
     }
 
-    /// @notice Verifies a prescription
+    /// @notice Verifies a prescription by pharmacy
     /// @param _prescriptionId Prescription ID
     /// @param _verificationCodeHash Verification code hash
     function verifyPrescription(uint32 _prescriptionId, bytes32 _verificationCodeHash)
@@ -573,20 +449,14 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         if (prescription.status != PrescriptionStatus.Generated) revert InvalidStatus();
         if (prescription.verificationCodeHash != _verificationCodeHash) revert NotAuthorized();
         if (block.timestamp > prescription.expirationTimestamp) revert InvalidTimestamp();
-        bool paid;
-        try paymentOps.getPrescriptionPaymentStatus(_prescriptionId) returns (bool status) {
-            paid = status;
-        } catch {
-            revert ExternalCallFailed();
-        }
-        if (!paid) revert PaymentNotConfirmed();
+        if (!paymentOps.getPrescriptionPaymentStatus(_prescriptionId)) revert PaymentNotConfirmed();
         if (prescription.prescriptionHash == bytes32(0)) revert InvalidParameter();
 
         prescription.status = PrescriptionStatus.Verified;
         emit PrescriptionVerified(_prescriptionId, keccak256(abi.encode(msg.sender)));
     }
 
-    /// @notice Fulfills a prescription
+    /// @notice Fulfills a prescription by pharmacy
     /// @param _prescriptionId Prescription ID
     function fulfillPrescription(uint32 _prescriptionId)
         external onlyRole(core.PHARMACY_ROLE()) nonReentrant whenNotPaused {
@@ -595,43 +465,29 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         if (prescription.pharmacy != msg.sender) revert NotAuthorized();
         if (prescription.status != PrescriptionStatus.Verified) revert InvalidStatus();
         if (block.timestamp > prescription.expirationTimestamp) revert InvalidTimestamp();
-        bool paid;
-        try paymentOps.getPrescriptionPaymentStatus(_prescriptionId) returns (bool status) {
-            paid = status;
-        } catch {
-            revert ExternalCallFailed();
-        }
-        if (!paid) revert PaymentNotConfirmed();
+        if (!paymentOps.getPrescriptionPaymentStatus(_prescriptionId)) revert PaymentNotConfirmed();
 
         prescription.status = PrescriptionStatus.Fulfilled;
-        uint64 disputeWindow;
-        try base.disputeWindow() returns (uint256 window) {
-            disputeWindow = uint64(window);
-        } catch {
-            revert ExternalCallFailed();
-        }
+        uint64 disputeWindow = uint64(base.disputeWindow());
         if (disputeWindow > MAX_DISPUTE_WINDOW) revert InvalidParameter();
         prescription.disputeWindowEnd = uint64(block.timestamp).add(disputeWindow);
         emit PrescriptionFulfilled(_prescriptionId);
         emit PrescriptionDisputeWindowStarted(_prescriptionId, keccak256(abi.encode(prescription.patient)), prescription.disputeWindowEnd);
     }
 
-    /// @notice Orders a replacement prescription
+    /// @notice Orders a replacement prescription after dispute
     /// @param _originalPrescriptionId Original prescription ID
-    /// @param _operationHash Operation hash
+    /// @param _operationHash Multi-sig operation hash
     function orderReplacementPrescription(uint32 _originalPrescriptionId, bytes32 _operationHash)
         external onlyDisputeResolution nonReentrant whenNotPaused onlyMultiSig(_operationHash) {
         if (_originalPrescriptionId == 0 || _originalPrescriptionId > prescriptionCounter) revert InvalidId();
         Prescription storage original = prescriptions[_originalPrescriptionId];
         if (original.status != PrescriptionStatus.Fulfilled) revert InvalidStatus();
         if (original.pharmacy == address(0)) revert InvalidAddress();
-        try core.patients(original.patient) returns (TelemedicineCore.Patient memory patient) {
-            if (!patient.isRegistered) revert NotAuthorized();
-        } catch {
-            revert ExternalCallFailed();
-        }
+        TelemedicineCore.Patient memory patient = core.patients(original.patient);
+        if (!patient.isRegistered) revert NotAuthorized();
 
-        prescriptionCounter = prescriptionCounter.add(1);
+        unchecked { prescriptionCounter++; }
         if (prescriptionCounter >= MAX_COUNTER) revert InvalidCounter();
         uint32 newPrescriptionId = uint32(prescriptionCounter);
         bytes32 newVerificationCodeHash = keccak256(abi.encodePacked(newPrescriptionId, original.doctor, block.timestamp, SALT));
@@ -651,102 +507,101 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
             disputeWindowEnd: 0,
             disputeOutcome: DisputeOutcome.Unresolved
         });
-        try paymentOps.setPrescriptionPayment(newPrescriptionId, true) {} catch {
-            revert ExternalCallFailed();
-        }
+        paymentOps.setPrescriptionPayment(newPrescriptionId, true);
 
         emit PrescriptionIssued(newPrescriptionId, keccak256(abi.encode(original.patient)), keccak256(abi.encode(original.doctor)), newVerificationCodeHash, uint64(block.timestamp));
         emit ReplacementPrescriptionOrdered(_originalPrescriptionId, newPrescriptionId);
     }
 
-    /// @notice Requests AI symptom analysis
-    /// @param _symptoms Symptoms
+    /// @notice Requests an AI symptom analysis, tied to a recent appointment
+    /// @param _symptoms Symptoms description
     function requestAISymptomAnalysis(string calldata _symptoms)
         external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
         if (bytes(_symptoms).length > MAX_STRING_LENGTH) revert InvalidParameter();
         if (aiAnalysisCounter >= MAX_COUNTER) revert InvalidCounter();
-        try core.decayPoints(msg.sender) {} catch {
-            revert ExternalCallFailed();
+
+        // Check for recent appointment
+        (uint256 appointmentId, uint64 appointmentTimestamp, bool isCompleted) = getRecentAppointment(msg.sender);
+        if (appointmentId == 0 || !isCompleted || block.timestamp > appointmentTimestamp.add(RECENT_APPOINTMENT_WINDOW)) {
+            revert NoRecentAppointment();
         }
-        TelemedicineCore.Patient storage patient;
-        try core.patients(msg.sender) returns (TelemedicineCore.Patient storage p) {
-            patient = p;
-        } catch {
-            revert ExternalCallFailed();
-        }
-        uint256 maxLevel;
-        try core.maxLevel() returns (uint256 level) {
-            maxLevel = level;
-        } catch {
-            revert ExternalCallFailed();
-        }
-        uint256 freeAnalysisPeriod;
-        try core.freeAnalysisPeriod() returns (uint256 period) {
-            freeAnalysisPeriod = period;
-        } catch {
-            revert ExternalCallFailed();
-        }
+
+        core.decayPoints(msg.sender);
+        TelemedicineCore.Patient storage patient = core.patients(msg.sender);
+        uint256 maxLevel = core.maxLevel();
+        uint256 freeAnalysisPeriod = core.freeAnalysisPeriod();
         bool isFree = patient.gamification.currentLevel == maxLevel &&
                       block.timestamp >= patient.lastFreeAnalysisTimestamp.add(freeAnalysisPeriod);
 
-        aiAnalysisCounter = aiAnalysisCounter.add(1);
+        unchecked { aiAnalysisCounter++; }
         uint32 newAnalysisId = uint32(aiAnalysisCounter);
-        aiAnalyses[newAnalysisId] = AISymptomAnalysis(newAnalysisId, msg.sender, false, keccak256(abi.encode(_symptoms)), bytes32(0));
-        uint96 points;
-        try core.pointsForActions("aiAnalysis") returns (uint256 p) {
-            points = uint96(p);
-        } catch {
-            revert ExternalCallFailed();
-        }
+        uint96 points = uint96(core.pointsForActions("aiAnalysis"));
+        aiAnalyses[newAnalysisId] = AISymptomAnalysis({
+            id: newAnalysisId,
+            patient: msg.sender,
+            doctorReviewed: false,
+            status: AISymptomAnalysisStatus.Pending,
+            symptomsHash: keccak256(abi.encode(_symptoms)),
+            analysisHash: bytes32(0),
+            reviewDeadline: uint64(block.timestamp.add(REVIEW_DEADLINE)),
+            pointsEarned: points
+        });
+
         patient.gamification.mediPoints = patient.gamification.mediPoints.add(points);
         patient.lastActivityTimestamp = uint64(block.timestamp);
 
         if (!isFree) {
-            uint256 aiCost;
-            try core.aiAnalysisCost() returns (uint256 cost) {
-                aiCost = cost;
-            } catch {
-                revert ExternalCallFailed();
-            }
-            uint256 aiFund;
-            try core.getAIFundBalance() returns (uint256 fund) {
-                aiFund = fund;
-            } catch {
-                revert ExternalCallFailed();
-            }
+            uint256 aiCost = core.aiAnalysisCost();
+            uint256 aiFund = core.getAIFundBalance();
             if (aiFund < aiCost) revert InsufficientFunds();
             core.aiAnalysisFund = aiFund.sub(aiCost);
         } else {
             patient.lastFreeAnalysisTimestamp = uint64(block.timestamp);
-            try paymentOps.notifyDataRewardClaimed(msg.sender, 0) {} catch {
-                // Non-critical, continue
-            }
+            try paymentOps.notifyDataRewardClaimed(msg.sender, 0) {} catch {}
         }
 
-        try core._levelUp(msg.sender) {} catch {
-            revert ExternalCallFailed();
-        }
+        core._levelUp(msg.sender);
         emit AISymptomAnalyzed(newAnalysisId, keccak256(abi.encode(msg.sender)));
-        try paymentOps.monetizeData(msg.sender) {} catch {
-            // Non-critical, continue
-        }
+        try paymentOps.monetizeData(msg.sender) {} catch {}
     }
 
-    /// @notice Reviews AI symptom analysis
+    /// @notice Reviews an AI symptom analysis by a doctor
     /// @param _aiAnalysisId AI analysis ID
-    /// @param _analysisIpfsHash Analysis IPFS hash
+    /// @param _analysisIpfsHash IPFS hash of reviewed analysis
     function reviewAISymptomAnalysis(uint32 _aiAnalysisId, string calldata _analysisIpfsHash)
         external onlyRole(core.DOCTOR_ROLE()) nonReentrant whenNotPaused {
         if (_aiAnalysisId == 0 || _aiAnalysisId > aiAnalysisCounter) revert InvalidId();
         if (bytes(_analysisIpfsHash).length > MAX_STRING_LENGTH) revert InvalidParameter();
         AISymptomAnalysis storage analysis = aiAnalyses[_aiAnalysisId];
-        if (analysis.doctorReviewed) revert InvalidStatus();
+        if (analysis.doctorReviewed || analysis.status != AISymptomAnalysisStatus.Pending) revert InvalidStatus();
+        if (block.timestamp > analysis.reviewDeadline) revert DeadlineMissed();
 
         analysis.analysisHash = keccak256(abi.encode(_analysisIpfsHash));
         analysis.doctorReviewed = true;
+        analysis.status = AISymptomAnalysisStatus.Reviewed;
+        emit AISymptomAnalysisReviewed(_aiAnalysisId, keccak256(abi.encode(analysis.patient)), analysis.analysisHash);
     }
 
-    /// @notice Updates dispute outcome
+    /// @notice Checks deadlines for AI analysis reviews and refunds points if expired
+    /// @param _aiAnalysisIds Array of AI analysis IDs
+    function batchCheckAIReviewDeadlines(uint32[] calldata _aiAnalysisIds) external nonReentrant whenNotPaused {
+        for (uint256 i = 0; i < _aiAnalysisIds.length; i++) {
+            uint32 _aiAnalysisId = _aiAnalysisIds[i];
+            if (_aiAnalysisId == 0 || _aiAnalysisId > aiAnalysisCounter) continue;
+            AISymptomAnalysis storage analysis = aiAnalyses[_aiAnalysisId];
+            if (analysis.status != AISymptomAnalysisStatus.Pending) continue;
+            if (block.timestamp <= analysis.reviewDeadline) continue;
+
+            analysis.status = AISymptomAnalysisStatus.Expired;
+            TelemedicineCore.Patient storage patient = core.patients(analysis.patient);
+            if (patient.gamification.mediPoints >= analysis.pointsEarned) {
+                patient.gamification.mediPoints = patient.gamification.mediPoints.sub(analysis.pointsEarned);
+            }
+            emit AISymptomAnalysisExpired(_aiAnalysisId, keccak256(abi.encode(analysis.patient)), analysis.pointsEarned);
+        }
+    }
+
+    /// @notice Updates dispute outcome for lab test or prescription
     /// @param _id Lab test or prescription ID
     /// @param _isLabTest True if lab test
     /// @param _outcome Dispute outcome
@@ -768,35 +623,47 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         emit DisputeOutcomeUpdated(_id, _outcome);
     }
 
-    // Events from paymentOps
-    event LabTestRefunded(uint32 indexed testId, address patient, uint256 amount);
-    event LabTestPaymentConfirmed(uint32 indexed testId, uint256 amount);
-    event PrescriptionPaymentConfirmed(uint32 indexed prescriptionId, uint256 amount);
-
     // Utility Functions
 
-    /// @notice Safely refunds ETH
+    /// @notice Safely refunds ETH to recipient
     /// @param _recipient Recipient address
-    /// @param _amount Amount
+    /// @param _amount Amount to refund
     function _safeRefund(address _recipient, uint256 _amount) internal {
         if (_amount == 0 || _recipient == address(0)) return;
-        try paymentOps.safeTransferETH(_recipient, _amount) {} catch {
-            revert ExternalCallFailed();
-        }
+        paymentOps.safeTransferETH(_recipient, _amount);
     }
 
     /// @notice Checks if an address is a contract
-    /// @param addr Address
-    /// @return True if contract
+    /// @param addr Address to check
+    /// @return True if address is a contract
     function _isContract(address addr) internal view returns (bool) {
         uint256 size;
         assembly { size := extcodesize(addr) }
         return size > 0;
     }
 
+    /// @notice Retrieves the most recent completed appointment for a patient
+    /// @param _patient Patient address
+    /// @return appointmentId Appointment ID
+    /// @return timestamp Appointment timestamp
+    /// @return isCompleted Whether the appointment is completed
+    function getRecentAppointment(address _patient) internal view returns (uint256 appointmentId, uint64 timestamp, bool isCompleted) {
+        if (_patient == address(0)) revert InvalidAddress();
+        uint256 counter = medicalCore.appointmentCounter();
+        // Scan recent appointments (limit to last 50 to avoid gas issues)
+        uint256 startId = counter > 50 ? counter.sub(50) : 1;
+        for (uint256 i = counter; i >= startId && i > 0; i--) {
+            TelemedicineMedicalCore.Appointment memory apt = medicalCore.getAppointment(i);
+            if (apt.patient == _patient && apt.status == TelemedicineMedicalCore.AppointmentStatus.Completed) {
+                return (apt.id, uint64(apt.scheduledTimestamp), true);
+            }
+        }
+        return (0, 0, false);
+    }
+
     // View Functions
 
-    /// @notice Gets lab test order
+    /// @notice Retrieves lab test order details
     /// @param _labTestId Lab test ID
     /// @return Order details
     function getLabTestOrder(uint32 _labTestId) external view onlyConfigAdmin returns (
@@ -838,7 +705,7 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         );
     }
 
-    /// @notice Gets prescription
+    /// @notice Retrieves prescription details
     /// @param _prescriptionId Prescription ID
     /// @return Prescription details
     function getPrescription(uint32 _prescriptionId) external view onlyConfigAdmin returns (
@@ -874,34 +741,56 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
         );
     }
 
-    /// @notice Gets AI symptom analysis
+    /// @notice Retrieves AI symptom analysis details
     /// @param _aiAnalysisId AI analysis ID
-    /// @return Analysis details
-    function getAISymptomAnalysis(uint32 _aiAnalysisId) external view onlyConfigAdmin returns (
+    /// @return id Analysis ID
+    /// @return patient Patient address
+    /// @return doctorReviewed Doctor review status
+    /// @return status Analysis status
+    /// @return symptomsHash Hashed symptoms
+    /// @return analysisHash Hashed analysis (restricted for patients until reviewed)
+    /// @return reviewDeadline Deadline for doctor review
+    /// @return pointsEarned Points earned for the analysis
+    function getAISymptomAnalysis(uint32 _aiAnalysisId) external view returns (
         uint32 id,
         address patient,
         bool doctorReviewed,
+        AISymptomAnalysisStatus status,
         bytes32 symptomsHash,
-        bytes32 analysisHash
+        bytes32 analysisHash,
+        uint64 reviewDeadline,
+        uint96 pointsEarned
     ) {
+        if (_aiAnalysisId == 0 || _aiAnalysisId > aiAnalysisCounter) revert InvalidId();
         AISymptomAnalysis storage analysis = aiAnalyses[_aiAnalysisId];
+
+        // Restrict analysisHash for patients until reviewed
+        if (msg.sender == analysis.patient && !analysis.doctorReviewed) {
+            revert AnalysisNotReviewed();
+        }
+
+        // Config admins or authorized roles can access full details
+        bool isAuthorized = core.isConfigAdmin(msg.sender) ||
+                           core.hasRole(core.DOCTOR_ROLE(), msg.sender) ||
+                           msg.sender == analysis.patient;
+        if (!isAuthorized) revert NotAuthorized();
+
         return (
             analysis.id,
             analysis.patient,
             analysis.doctorReviewed,
+            analysis.status,
             analysis.symptomsHash,
-            analysis.analysisHash
+            analysis.doctorReviewed ? analysis.analysisHash : bytes32(0),
+            analysis.reviewDeadline,
+            analysis.pointsEarned
         );
     }
 
     // Modifiers
 
     modifier onlyRole(bytes32 role) {
-        try core.hasRole(role, msg.sender) returns (bool hasRole) {
-            if (!hasRole) revert NotAuthorized();
-        } catch {
-            revert ExternalCallFailed();
-        }
+        if (!core.hasRole(role, msg.sender)) revert NotAuthorized();
         _;
     }
 
@@ -911,53 +800,35 @@ contract TelemedicineClinicalOperations is Initializable, ReentrancyGuardUpgrade
     }
 
     modifier onlyConfigAdmin() {
-        try core.isConfigAdmin(msg.sender) returns (bool isAdmin) {
-            if (!isAdmin) revert NotAuthorized();
-        } catch {
-            revert ExternalCallFailed();
-        }
+        if (!core.isConfigAdmin(msg.sender)) revert NotAuthorized();
         _;
     }
 
     modifier whenNotPaused() {
-        try core.paused() returns (bool corePaused) {
-            if (corePaused != paused()) {
-                corePaused ? _pause() : _unpause();
-            }
-            if (paused()) revert ContractPaused();
-        } catch {
-            revert ExternalCallFailed();
+        bool corePaused = core.paused();
+        if (corePaused != paused()) {
+            corePaused ? _pause() : _unpause();
         }
+        if (paused()) revert ContractPaused();
         _;
     }
 
     modifier onlyMultiSig(bytes32 _operationHash) {
-        uint256 nonce;
-        try base.nonces(msg.sender) returns (uint256 n) {
-            nonce = n;
-        } catch {
-            revert ExternalCallFailed();
-        }
+        uint256 nonce = base.nonces(msg.sender);
         bytes32 expectedHash = keccak256(abi.encodePacked(
             "orderReplacementPrescription",
             msg.sender,
             nonce,
             block.timestamp
         ));
-        if (_operationHash != expectedHash) revert MultiSigNotApproved();
-        try paymentOps.checkMultiSigApproval(_operationHash) returns (bool approved) {
-            if (!approved) revert MultiSigNotApproved();
-        } catch {
-            revert ExternalCallFailed();
-        }
-        try base.nonces(msg.sender) returns (uint256) {
-            base.nonces(msg.sender) = nonce.add(1);
-        } catch {
-            revert ExternalCallFailed();
-        }
+        if (_operationHash != expectedHash || !paymentOps.checkMultiSigApproval(_operationHash)) revert MultiSigNotApproved();
+        base.nonces(msg.sender) = nonce.add(1);
         _;
     }
 
     // Fallback
     receive() external payable {}
+
+    // Storage Gap for Future Upgrades
+    uint256[50] private __gap;
 }
