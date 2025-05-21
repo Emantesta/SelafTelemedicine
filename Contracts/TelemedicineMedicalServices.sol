@@ -14,7 +14,7 @@ import {TelemedicineMedicalCore} from "./TelemedicineMedicalCore.sol";
 /// @title TelemedicineMedicalServices
 /// @notice Manages lab technician and pharmacy services, pricing, ratings, disputes, and data monetization
 /// @dev UUPS upgradeable, integrates with TelemedicineCore, Payments, DisputeResolution, and MedicalCore
-/// @dev Optimized for Sonic Blockchain (EVM-compatible L2). Prices are in Sonic USDC (6 decimals); rewards in Sonic $S (18 decimals).
+/// @dev Optimized for Sonic Blockchain. Prices in Sonic USDC (6 decimals); rewards in Sonic $S (18 decimals, validated in TelemedicinePayments).
 contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable {
     using SafeMathUpgradeable for uint256;
     using SafeERC20Upgradeable for IERC20Upgradeable;
@@ -43,8 +43,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     error InvalidMultiSigConfig();
     error ExternalCallFailed();
     error InvalidEvidenceHash();
-    error InvalidRewardAmount(); // New: For reward validation
-    error InvalidRewardBounds(); // New: For reward bounds configuration
 
     // Contract dependencies
     TelemedicineCore public core;
@@ -63,8 +61,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     uint256 public constant MIN_PRICE = 10_000; // 0.01 USDC (10^4 units, 6 decimals)
     uint256 public constant MAX_PRICE = 10_000_000_000; // 10,000 USDC (10^10 units, 6 decimals)
     bool public pricingPaused;
-    uint256 public MIN_REWARD; // New: Min reward in Sonic $S (18 decimals)
-    uint256 public MAX_REWARD; // New: Max reward in Sonic $S (18 decimals)
 
     // State Variables
     mapping(address => mapping(string => PriceEntry)) private labTechPrices;
@@ -125,7 +121,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     event PriceExpirationPeriodUpdated(uint48 newPeriod);
     event MaxBatchSizeUpdated(uint256 newSize);
     event PricingPaused(bool paused);
-    event RewardBoundsUpdated(uint256 newMinReward, uint256 newMaxReward); // New: Reward bounds update
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -169,13 +164,10 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
         priceExpirationPeriod = 30 days;
         maxBatchSize = 50;
         pricingPaused = false;
-        MIN_REWARD = 10_000_000_000_000_000; // 0.01 $S (10^16 units, 18 decimals)
-        MAX_REWARD = 1_000_000_000_000_000_000_000; // 1000 $S (10^21 units, 18 decimals)
 
         emit PriceExpirationPeriodUpdated(30 days);
         emit MaxBatchSizeUpdated(50);
         emit PricingPaused(false);
-        emit RewardBoundsUpdated(MIN_REWARD, MAX_REWARD); // New: Emit initial bounds
     }
 
     /// @notice Authorizes contract upgrades (admin only)
@@ -303,22 +295,6 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     function togglePricingPause(bool _paused) external onlyRole(core.ADMIN_ROLE()) {
         pricingPaused = _paused;
         emit PricingPaused(_paused);
-    }
-
-    /// @notice Updates the minimum and maximum reward bounds for data monetization
-    /// @param _newMinReward New minimum reward in Sonic $S units (18 decimals)
-    /// @param _newMaxReward New maximum reward in Sonic $S units (18 decimals)
-    /// @dev Restricted to ADMIN_ROLE; ensures min <= max and reasonable bounds
-    function updateRewardBounds(uint256 _newMinReward, uint256 _newMaxReward) 
-        external 
-        onlyRole(core.ADMIN_ROLE()) 
-    {
-        if (_newMinReward == 0 || _newMinReward > _newMaxReward) revert InvalidRewardBounds();
-        if (_newMaxReward > type(uint192).max) revert InvalidRewardBounds(); // Ensure fits in potential future storage
-
-        MIN_REWARD = _newMinReward;
-        MAX_REWARD = _newMaxReward;
-        emit RewardBoundsUpdated(_newMinReward, _newMaxReward);
     }
 
     // Rating System
@@ -511,35 +487,32 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     /// @notice Allows MedicalCore to trigger data reward claims
     /// @param _patient Address of the patient
     /// @param _amount Reward amount in Sonic $S units (18 decimals)
-    /// @dev Validates _amount against MIN_REWARD and MAX_REWARD
+    /// @dev Queues payment via TelemedicinePayments; validation handled there
     function monetizeData(address _patient, uint256 _amount) external onlyMedicalCore {
         TelemedicineCore.Patient memory patient = core.patients(_patient);
         if (patient.dataSharing != TelemedicineCore.DataSharingStatus.Enabled) revert NotAuthorized();
         if (block.timestamp < patient.lastActivityTimestamp + 1 days) revert InvalidTimestamp();
-        if (_amount < MIN_REWARD || _amount > MAX_REWARD) revert InvalidRewardAmount(); // New: Reward validation
 
-        IERC20Upgradeable sonicSToken = payments.sonicNativeToken(); // Sonic $S token
-        if (sonicSToken.balanceOf(address(payments)) < _amount) revert InsufficientFunds();
-
-        sonicSToken.safeTransferFrom(address(payments), _patient, _amount);
-        emit DataRewardClaimed(_patient, _amount);
+        try payments.queuePayment(_patient, _amount, ITelemedicinePayments.PaymentType.SONIC) {
+            emit DataRewardClaimed(_patient, _amount);
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
 
     /// @notice Allows patients to claim data monetization rewards
-    /// @dev Reward is paid in Sonic $S units (18 decimals), validated against MIN_REWARD and MAX_REWARD
+    /// @dev Queues payment via TelemedicinePayments; validation handled there
     function claimDataReward() external onlyRole(core.PATIENT_ROLE()) nonReentrant whenNotPaused {
         TelemedicineCore.Patient memory patient = core.patients(msg.sender);
         if (patient.dataSharing != TelemedicineCore.DataSharingStatus.Enabled) revert NotAuthorized();
         if (block.timestamp < patient.lastActivityTimestamp + 1 days) revert InvalidTimestamp();
 
         uint256 reward = core.dataMonetizationReward(); // In Sonic $S units
-        if (reward < MIN_REWARD || reward > MAX_REWARD) revert InvalidRewardAmount(); // New: Reward validation
-
-        IERC20Upgradeable sonicSToken = payments.sonicNativeToken(); // Sonic $S token
-        if (sonicSToken.balanceOf(address(payments)) < reward) revert InsufficientFunds();
-
-        sonicSToken.safeTransferFrom(address(payments), msg.sender, reward);
-        emit DataRewardClaimed(msg.sender, reward);
+        try payments.queuePayment(msg.sender, reward, ITelemedicinePayments.PaymentType.SONIC) {
+            emit DataRewardClaimed(msg.sender, reward);
+        } catch {
+            revert ExternalCallFailed();
+        }
     }
 
     // Multi-Sig Functions
@@ -833,5 +806,5 @@ contract TelemedicineMedicalServices is Initializable, UUPSUpgradeable, Reentran
     }
 
     // Storage gap
-    uint256[47] private __gap; // Reduced from 49 due to MIN_REWARD, MAX_REWARD
+    uint256[49] private __gap; // Increased to 49 after removing MIN_REWARD, MAX_REWARD
 }
