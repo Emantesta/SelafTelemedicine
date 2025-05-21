@@ -16,13 +16,17 @@ interface IERC20Upgradeable {
 }
 
 /// @title TelemedicinePayments Interface
-/// @notice Handles payment processing and refunds in ETH, USDC, or SONIC tokens
-interface TelemedicinePayments {
+/// @notice Handles payment processing, refunds, $S reward validation, and cancellation of pending payments
+interface ITelemedicinePayments {
     enum PaymentType { ETH, USDC, SONIC }
     function _processPayment(PaymentType paymentType, uint256 amount) external payable;
     function _refundPatient(address patient, uint256 amount, PaymentType paymentType) external;
     function usdcToken() external view returns (IERC20Upgradeable);
     function sonicToken() external view returns (IERC20Upgradeable);
+    function sonicNativeToken() external view returns (IERC20Upgradeable);
+    function queuePayment(address recipient, uint256 amount, PaymentType paymentType) external;
+    function getRewardBounds() external view returns (uint256 minReward, uint256 maxReward);
+    function cancelPendingPayment(address recipient, uint256 paymentId) external returns (bool);
 }
 
 /// @title TelemedicineDisputeResolution Interface
@@ -56,6 +60,7 @@ interface TelemedicineMedicalServices {
 /// @title TelemedicineCore
 /// @notice Core contract for the telemedicine platform on Sonic Blockchain
 /// @dev UUPS upgradeable, integrates with Chainlink, and manages roles, patients, and gamification
+/// @dev $S reward validation is centralized in ITelemedicinePayments via queuePayment
 contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, ChainlinkClient {
     using Chainlink for Chainlink.Request;
 
@@ -114,6 +119,8 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     uint256 public reserveFundUSDC; // Tracks USDC reserve fund
     uint256 public reserveFundSONIC; // Tracks SONIC reserve fund
     mapping(bytes32 => uint256) public chainlinkRequestToPrice;
+    mapping(address => mapping(uint256 => PendingPayment)) public pendingPayments; // recipient => paymentId => PendingPayment
+    uint256 public nextPaymentId; // Tracks next available payment ID
 
     // Structs
     struct Patient {
@@ -124,6 +131,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         uint48 registrationTimestamp;
         uint48 lastActivityTimestamp;
         uint48 lastFreeAnalysisTimestamp;
+        uint48 lastRewardTimestamp;
         bytes32 encryptedSymmetricKeyHash;
     }
 
@@ -148,9 +156,17 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         string licenseNumber;
     }
 
+    struct PendingPayment {
+        uint256 amount;
+        ITelemedicinePayments.PaymentType paymentType;
+        uint48 queuedTimestamp;
+        bool isActive;
+    }
+
     // Enums
     enum DataSharingStatus { Disabled, Enabled }
     enum DisputeOutcome { Unresolved, PatientFavored, ProviderFavored, MutualAgreement }
+
     enum ConfigParameter {
         DoctorFeePercentage,
         ReserveFundPercentage,
@@ -176,7 +192,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     // External Contracts
-    TelemedicinePayments public payments;
+    ITelemedicinePayments public payments;
     TelemedicineDisputeResolution public disputeResolution;
     TelemedicineMedicalServices public services;
 
@@ -190,13 +206,15 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     event PointsDecayed(address indexed patient, uint256 decayedPoints);
     event FreeAnalysisClaimed(address indexed patient);
     event AIFundDeposited(address indexed sender, uint256 amount);
-    event ReserveFundDeposited(address indexed sender, uint256 amount, TelemedicinePayments.PaymentType paymentType);
-    event MinBalanceAlert(address indexed contractAddress, uint256 balance, TelemedicinePayments.PaymentType paymentType);
+    event ReserveFundDeposited(address indexed sender, uint256 amount, ITelemedicinePayments.PaymentType paymentType);
+    event MinBalanceAlert(address indexed contractAddress, uint256 balance, ITelemedicinePayments.PaymentType paymentType);
     event AuditLog(uint256 indexed timestamp, address indexed actor, string action);
     event DisputeResolutionUpdated(address indexed oldAddress, address indexed newAddress);
     event ConfigurationUpdated(ConfigParameter parameter, uint256 value);
     event ChainlinkPriceReceived(bytes32 requestId, uint256 price);
-    event ReserveFundUpdated(TelemedicinePayments.PaymentType paymentType, uint256 newBalance);
+    event ReserveFundUpdated(ITelemedicinePayments.PaymentType paymentType, uint256 newBalance);
+    event DataRewardClaimed(address indexed patient, uint256 reward, uint256 paymentId);
+    event PendingPaymentCanceled(address indexed recipient, uint256 paymentId);
 
     // Custom Errors
     error TelemedicineCore__InvalidAddress();
@@ -212,6 +230,9 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     error TelemedicineCore__InvalidParameterValue();
     error TelemedicineCore__InsufficientLinkBalance();
     error TelemedicineCore__TokenTransferFailed();
+    error TelemedicineCore__InvalidRewardAmount();
+    error TelemedicineCore__InvalidPaymentId();
+    error TelemedicineCore__PaymentNotActive();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -250,7 +271,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         minBookingBuffer = 15 minutes;
         minCancellationBuffer = 1 hours;
         verificationTimeout = 7 days;
-        dataMonetizationReward = 10 * 10**18;
+        dataMonetizationReward = 10 * 10**18; // 10 $S
         aiAnalysisCost = 0.01 ether;
         pointsPerLevel = 100;
         maxLevel = 10;
@@ -269,13 +290,14 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         paymentConfirmationDeadline = 3 days;
         invitationExpirationPeriod = 30 days;
         maxDoctorsPerAppointment = 3;
+        nextPaymentId = 1; // Initialize payment ID counter
 
         discountLevels[3] = 5;
         discountLevels[5] = 10;
         pointsForActions["appointment"] = 20;
         pointsForActions["aiAnalysis"] = 10;
 
-        payments = TelemedicinePayments(_payments);
+        payments = ITelemedicinePayments(_payments);
         disputeResolution = TelemedicineDisputeResolution(_disputeResolution);
         services = TelemedicineMedicalServices(_services);
         chainlinkOracle = _chainlinkOracle;
@@ -378,6 +400,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
             uint48(block.timestamp),
             uint48(block.timestamp),
             0,
+            0,
             _encryptedSymmetricKeyHash
         );
         _grantRole(PATIENT_ROLE, msg.sender);
@@ -391,9 +414,11 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         if (_enable && patient.dataSharing == DataSharingStatus.Disabled) {
             patient.dataSharing = DataSharingStatus.Enabled;
             patient.lastActivityTimestamp = uint48(block.timestamp);
+            patient.lastRewardTimestamp = uint48(block.timestamp);
         } else if (!_enable && patient.dataSharing == DataSharingStatus.Enabled) {
             _claimDataReward(msg.sender);
             patient.dataSharing = DataSharingStatus.Disabled;
+            patient.lastRewardTimestamp = 0;
         }
         emit DataMonetizationOptIn(msg.sender, _enable);
     }
@@ -456,8 +481,8 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Deposits funds into the reserve fund for a specific payment type (admin only)
-    function depositReserveFund(TelemedicinePayments.PaymentType _paymentType) external payable onlyRole(ADMIN_ROLE) {
-        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+    function depositReserveFund(ITelemedicinePayments.PaymentType _paymentType) external payable onlyRole(ADMIN_ROLE) {
+        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
             if (msg.value == 0) revert TelemedicineCore__InsufficientFunds();
             reserveFundETH += msg.value;
             emit ReserveFundDeposited(msg.sender, msg.value, _paymentType);
@@ -465,7 +490,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         } else {
             IERC20Upgradeable token;
             uint256 amount;
-            if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+            if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
                 token = payments.usdcToken();
                 amount = token.balanceOf(msg.sender);
                 if (amount == 0) revert TelemedicineCore__InsufficientFunds();
@@ -475,8 +500,8 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
                 } catch {
                     revert TelemedicineCore__TokenTransferFailed();
                 }
-            } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
-                token = payments.sonicToken();
+            } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+                token = payments.sonicNativeToken();
                 amount = token.balanceOf(msg.sender);
                 if (amount == 0) revert TelemedicineCore__InsufficientFunds();
                 try token.transferFrom(msg.sender, address(this), amount) returns (bool success) {
@@ -494,13 +519,13 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Updates the reserve fund balance for a specific payment type (payments only)
-    function updateReserveFund(TelemedicinePayments.PaymentType _paymentType, uint256 _amount) external {
+    function updateReserveFund(ITelemedicinePayments.PaymentType _paymentType, uint256 _amount) external {
         if (msg.sender != address(payments)) revert TelemedicineCore__NotAuthorized();
-        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
             reserveFundETH = _amount;
-        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
             reserveFundUSDC = _amount;
-        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
             reserveFundSONIC = _amount;
         } else {
             revert TelemedicineCore__InvalidStatus();
@@ -510,24 +535,50 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Batch updates reserve fund balances for multiple payment types (payments only)
-    function batchUpdateReserveFund(TelemedicinePayments.PaymentType[] calldata _paymentTypes, uint256[] calldata _amounts) external {
+    /// @dev Optimized for gas by minimizing storage writes and reusing variables
+    function batchUpdateReserveFund(ITelemedicinePayments.PaymentType[] calldata _paymentTypes, uint256[] calldata _amounts) external {
         if (msg.sender != address(payments)) revert TelemedicineCore__NotAuthorized();
-        if (_paymentTypes.length != _amounts.length || _paymentTypes.length > maxBatchSize) revert TelemedicineCore__InvalidParameterValue();
-        for (uint256 i = 0; i < _paymentTypes.length; i++) {
-            TelemedicinePayments.PaymentType paymentType = _paymentTypes[i];
+        uint256 length = _paymentTypes.length;
+        if (length != _amounts.length || length > maxBatchSize) revert TelemedicineCore__InvalidParameterValue();
+
+        // Cache storage variables to reduce SLOADs
+        uint256 ethBalance = reserveFundETH;
+        uint256 usdcBalance = reserveFundUSDC;
+        uint256 sonicBalance = reserveFundSONIC;
+
+        for (uint256 i = 0; i < length; ++i) {
+            ITelemedicinePayments.PaymentType paymentType = _paymentTypes[i];
             uint256 amount = _amounts[i];
-            if (paymentType == TelemedicinePayments.PaymentType.ETH) {
-                reserveFundETH = amount;
-            } else if (paymentType == TelemedicinePayments.PaymentType.USDC) {
-                reserveFundUSDC = amount;
-            } else if (paymentType == TelemedicinePayments.PaymentType.SONIC) {
-                reserveFundSONIC = amount;
+            if (paymentType == ITelemedicinePayments.PaymentType.ETH) {
+                ethBalance = amount;
+            } else if (paymentType == ITelemedicinePayments.PaymentType.USDC) {
+                usdcBalance = amount;
+            } else if (paymentType == ITelemedicinePayments.PaymentType.SONIC) {
+                sonicBalance = amount;
             } else {
                 revert TelemedicineCore__InvalidStatus();
             }
-            _checkMinBalance(paymentType);
-            emit ReserveFundUpdated(paymentType, amount);
+            // Defer balance check to reduce redundant calls
         }
+
+        // Batch storage writes
+        reserveFundETH = ethBalance;
+        reserveFundUSDC = usdcBalance;
+        reserveFundSONIC = sonicBalance;
+
+        // Batch balance checks
+        if (ethBalance < minReserveBalance) {
+            emit MinBalanceAlert(address(this), ethBalance, ITelemedicinePayments.PaymentType.ETH);
+        }
+        if (usdcBalance < minReserveBalance) {
+            emit MinBalanceAlert(address(this), usdcBalance, ITelemedicinePayments.PaymentType.USDC);
+        }
+        if (sonicBalance < minReserveBalance) {
+            emit MinBalanceAlert(address(this), sonicBalance, ITelemedicinePayments.PaymentType.SONIC);
+        }
+
+        // Emit single event for batch update
+        emit AuditLog(block.timestamp, msg.sender, "Batch Reserve Fund Updated");
     }
 
     /// @notice Updates the dispute resolution contract (admin only)
@@ -584,6 +635,37 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         discountLevels[_level] = _discountPercentage;
     }
 
+    /// @notice Retrieves details of a pending payment for auditing
+    /// @param _recipient The address of the payment recipient (e.g., patient)
+    /// @param _paymentId The unique ID of the pending payment
+    /// @return amount The payment amount
+    /// @return paymentType The payment type (ETH, USDC, SONIC)
+    /// @return queuedTimestamp When the payment was queued
+    /// @return isActive Whether the payment is still active
+    function getPendingPayment(address _recipient, uint256 _paymentId)
+        external
+        view
+        returns (uint256 amount, ITelemedicinePayments.PaymentType paymentType, uint48 queuedTimestamp, bool isActive)
+    {
+        PendingPayment memory payment = pendingPayments[_recipient][_paymentId];
+        if (!payment.isActive && payment.amount == 0) revert TelemedicineCore__InvalidPaymentId();
+        return (payment.amount, payment.paymentType, payment.queuedTimestamp, payment.isActive);
+    }
+
+    /// @notice Cancels a pending reward payment (patient or admin only)
+    /// @param _paymentId The unique ID of the pending payment
+    function cancelPendingPayment(uint256 _paymentId) external whenNotPaused {
+        if (!hasRole(PATIENT_ROLE, msg.sender) && !hasRole(ADMIN_ROLE, msg.sender)) revert TelemedicineCore__NotAuthorized();
+        PendingPayment storage payment = pendingPayments[msg.sender][_paymentId];
+        if (!payment.isActive) revert TelemedicineCore__PaymentNotActive();
+
+        bool success = payments.cancelPendingPayment(msg.sender, _paymentId);
+        if (!success) revert TelemedicineCore__InvalidPaymentId();
+
+        payment.isActive = false;
+        emit PendingPaymentCanceled(msg.sender, _paymentId);
+    }
+
     // Internal Functions
 
     /// @notice Validates fee percentages sum to 100
@@ -596,14 +678,37 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     function _claimDataReward(address _patient) internal {
         Patient storage patient = patients[_patient];
         if (patient.dataSharing != DataSharingStatus.Enabled) revert TelemedicineCore__InvalidStatus();
-        if (block.timestamp <= patient.lastActivityTimestamp) revert TelemedicineCore__InvalidTimestamp();
+        if (block.timestamp < patient.lastRewardTimestamp + 1 days) revert TelemedicineCore__InvalidTimestamp();
 
-        uint256 timeElapsed = block.timestamp - patient.lastActivityTimestamp;
+        uint256 timeElapsed = block.timestamp - patient.lastRewardTimestamp;
         uint256 reward = (timeElapsed * dataMonetizationReward) / 1 days;
-        uint256 newPoints = patient.gamification.mediPoints + reward;
-        patient.gamification.mediPoints = uint96(newPoints > type(uint96).max ? type(uint96).max : newPoints);
-        patient.lastActivityTimestamp = uint48(block.timestamp);
-        _levelUp(_patient);
+
+        // Validate reward bounds
+        (uint256 minReward, uint256 maxReward) = payments.getRewardBounds();
+        if (reward < minReward || reward > maxReward) revert TelemedicineCore__InvalidRewardAmount();
+
+        // Assign payment ID and store pending payment
+        uint256 paymentId = nextPaymentId++;
+        pendingPayments[_patient][paymentId] = PendingPayment({
+            amount: reward,
+            paymentType: ITelemedicinePayments.PaymentType.SONIC,
+            queuedTimestamp: uint48(block.timestamp),
+            isActive: true
+        });
+
+        // Queue reward payment
+        try payments.queuePayment(_patient, reward, ITelemedicinePayments.PaymentType.SONIC) {
+            patient.lastRewardTimestamp = uint48(block.timestamp);
+            pendingPayments[_patient][paymentId].isActive = false; // Mark as processed
+            uint256 newPoints = patient.gamification.mediPoints + reward;
+            patient.gamification.mediPoints = uint96(newPoints > type(uint96).max ? type(uint96).max : newPoints);
+            patient.lastActivityTimestamp = uint48(block.timestamp);
+            _levelUp(_patient);
+            services.notifyDataRewardClaimed(_patient, reward);
+            emit DataRewardClaimed(_patient, reward, paymentId);
+        } catch {
+            // Keep payment pending for later cancellation
+        }
     }
 
     /// @notice Decays patient points based on inactivity
@@ -648,7 +753,7 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     }
 
     /// @notice Checks if the reserve balance for a payment type is below the minimum
-    function _checkMinBalance(TelemedicinePayments.PaymentType _paymentType) internal {
+    function _checkMinBalance(ITelemedicinePayments.PaymentType _paymentType) internal {
         uint256 balance = getReserveFundBalance(_paymentType);
         if (balance < minReserveBalance) {
             emit MinBalanceAlert(address(this), balance, _paymentType);
@@ -684,12 +789,12 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
         return aiAnalysisFund;
     }
 
-    function getReserveFundBalance(TelemedicinePayments.PaymentType _paymentType) public view returns (uint256) {
-        if (_paymentType == TelemedicinePayments.PaymentType.ETH) {
+    function getReserveFundBalance(ITelemedicinePayments.PaymentType _paymentType) public view returns (uint256) {
+        if (_paymentType == ITelemedicinePayments.PaymentType.ETH) {
             return reserveFundETH;
-        } else if (_paymentType == TelemedicinePayments.PaymentType.USDC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.USDC) {
             return reserveFundUSDC;
-        } else if (_paymentType == TelemedicinePayments.PaymentType.SONIC) {
+        } else if (_paymentType == ITelemedicinePayments.PaymentType.SONIC) {
             return reserveFundSONIC;
         }
         revert TelemedicineCore__InvalidStatus();
@@ -722,10 +827,10 @@ contract TelemedicineCore is Initializable, UUPSUpgradeable, AccessControlUpgrad
     // Fallback
     receive() external payable onlyRole(ADMIN_ROLE) {
         reserveFundETH += msg.value;
-        emit ReserveFundDeposited(msg.sender, msg.value, TelemedicinePayments.PaymentType.ETH);
-        _checkMinBalance(TelemedicinePayments.PaymentType.ETH);
+        emit ReserveFundDeposited(msg.sender, msg.value, ITelemedicinePayments.PaymentType.ETH);
+        _checkMinBalance(ITelemedicinePayments.PaymentType.ETH);
     }
 
     // Storage gap for future upgrades
-    uint256[50] private __gap;
+    uint256[49] private __gap; // Reduced by 1 due to nextPaymentId
 }
